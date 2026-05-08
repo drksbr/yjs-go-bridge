@@ -67,6 +67,7 @@ func IntersectSets(left, right *IdSet) *IdSet {
 	}
 
 	result := New()
+	result.clients = make(map[uint32][]Range)
 	for _, client := range left.Clients() {
 		a := left.clients[client]
 		b := right.clients[client]

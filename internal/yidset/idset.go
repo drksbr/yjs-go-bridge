@@ -13,7 +13,7 @@ type IdSet = Set
 
 // New cria um conjunto vazio.
 func New() *IdSet {
-	return &IdSet{clients: make(map[uint32][]Range)}
+	return &IdSet{}
 }
 
 // Clone cria uma cópia profunda do conjunto.
@@ -23,6 +23,9 @@ func (s *IdSet) Clone() *IdSet {
 	}
 
 	cloned := New()
+	if len(s.clients) > 0 {
+		cloned.clients = make(map[uint32][]Range, len(s.clients))
+	}
 	for client, ranges := range s.clients {
 		cloned.clients[client] = slices.Clone(ranges)
 	}

@@ -9,11 +9,11 @@ import (
 )
 
 type decoderV1 struct {
-	reader *ybinary.Reader
+	reader ybinary.Reader
 }
 
 func newDecoderV1(data []byte) *decoderV1 {
-	return &decoderV1{reader: ybinary.NewReader(data)}
+	return &decoderV1{reader: ybinary.NewReaderValue(data)}
 }
 
 func (d *decoderV1) offset() int {
@@ -25,7 +25,7 @@ func (d *decoderV1) remaining() int {
 }
 
 func (d *decoderV1) readVarUint(op string) (uint32, error) {
-	value, _, err := varint.Read(d.reader)
+	value, _, err := varint.Read(&d.reader)
 	if err != nil {
 		return 0, wrapError(op, d.offset(), err)
 	}
@@ -41,7 +41,7 @@ func (d *decoderV1) readInfo() (byte, error) {
 }
 
 func (d *decoderV1) readID(op string) (ytypes.ID, error) {
-	id, _, err := ytypes.ReadID(d.reader)
+	id, _, err := ytypes.ReadID(&d.reader)
 	if err != nil {
 		return ytypes.ID{}, wrapError(op, d.offset(), err)
 	}

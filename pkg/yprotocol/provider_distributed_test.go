@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +14,80 @@ import (
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/ycluster"
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/yjsbridge"
 )
+
+func TestProviderOpenCoalescesConcurrentRoomLoads(t *testing.T) {
+	t.Parallel()
+
+	key := storage.DocumentKey{
+		Namespace:  "tests",
+		DocumentID: "provider-concurrent-room-load",
+	}
+	snapshot, err := yjsbridge.PersistedSnapshotFromUpdate(buildGCOnlyUpdate(97, 1))
+	if err != nil {
+		t.Fatalf("PersistedSnapshotFromUpdate() unexpected error: %v", err)
+	}
+
+	releaseLoad := make(chan struct{})
+	var loadCalls atomic.Int32
+	store := testSnapshotStore{
+		loadSnapshot: func(ctx context.Context, got storage.DocumentKey) (*storage.SnapshotRecord, error) {
+			loadCalls.Add(1)
+			select {
+			case <-releaseLoad:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return &storage.SnapshotRecord{
+				Key:      got,
+				Snapshot: snapshot.Clone(),
+			}, nil
+		},
+	}
+	provider := NewProvider(ProviderConfig{Store: store})
+
+	const workers = 8
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for idx := 0; idx < workers; idx++ {
+		idx := idx
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := provider.Open(context.Background(), key, "conn-"+string(rune('a'+idx)), uint32(100+idx))
+			if err == nil {
+				_, _ = conn.Close()
+			}
+			errCh <- err
+		}()
+	}
+
+	waitForProviderLoadCall(t, &loadCalls)
+	time.Sleep(20 * time.Millisecond)
+	close(releaseLoad)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("Open() concurrent unexpected error: %v", err)
+		}
+	}
+	if got := loadCalls.Load(); got != 1 {
+		t.Fatalf("LoadSnapshot() calls = %d, want 1 coalesced load", got)
+	}
+}
+
+func waitForProviderLoadCall(t *testing.T, calls *atomic.Int32) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if calls.Load() > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("LoadSnapshot() was not called before timeout")
+}
 
 func TestProviderOpenRecoversSnapshotPlusTail(t *testing.T) {
 	t.Parallel()
@@ -95,8 +171,12 @@ func TestProviderSyncUpdateAppendsLogAndPersistTrimsTail(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("len(records) = %d, want 1", len(records))
 	}
-	if !bytes.Equal(records[0].UpdateV1, update) {
-		t.Fatalf("records[0].UpdateV1 = %v, want %v", records[0].UpdateV1, update)
+	if len(records[0].UpdateV1) != 0 {
+		t.Fatalf("records[0].UpdateV1 = %v, want empty V2-only storage payload", records[0].UpdateV1)
+	}
+	assertProtocolV2PayloadEquivalentToV1(t, records[0].UpdateV2, update)
+	if len(records[0].UpdateV2) == 0 {
+		t.Fatal("records[0].UpdateV2 is empty, want canonical V2 payload")
 	}
 	if records[0].Epoch != 0 {
 		t.Fatalf("records[0].Epoch = %d, want 0", records[0].Epoch)
@@ -175,11 +255,15 @@ func TestProviderSyncUpdateAppendsCanonicalV1ForV2Input(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("len(records) = %d, want 1", len(records))
 	}
-	if !bytes.Equal(records[0].UpdateV1, v1Update) {
-		t.Fatalf("records[0].UpdateV1 = %x, want canonical V1 %x", records[0].UpdateV1, v1Update)
+	if len(records[0].UpdateV1) != 0 {
+		t.Fatalf("records[0].UpdateV1 = %x, want empty V2-only storage payload", records[0].UpdateV1)
 	}
-	if bytes.Equal(records[0].UpdateV1, v2Update) {
-		t.Fatalf("records[0].UpdateV1 preserved V2 bytes: %x", records[0].UpdateV1)
+	assertProtocolV2PayloadEquivalentToV1(t, records[0].UpdateV2, v1Update)
+	if bytes.Equal(records[0].UpdateV2, v1Update) {
+		t.Fatalf("records[0].UpdateV2 preserved V1 bytes: %x", records[0].UpdateV2)
+	}
+	if !bytes.Equal(records[0].UpdateV2, v2Update) {
+		t.Fatalf("records[0].UpdateV2 = %x, want canonical V2 %x", records[0].UpdateV2, v2Update)
 	}
 }
 
@@ -509,9 +593,10 @@ func TestProviderAuthorityLossOnPersistPreservesTail(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("len(store.ListUpdates()) = %d, want 1", len(records))
 	}
-	if !bytes.Equal(records[0].UpdateV1, update) {
-		t.Fatalf("records[0].UpdateV1 = %v, want %v", records[0].UpdateV1, update)
+	if len(records[0].UpdateV1) != 0 {
+		t.Fatalf("records[0].UpdateV1 = %v, want empty V2-only storage payload", records[0].UpdateV1)
 	}
+	assertProtocolV2PayloadEquivalentToV1(t, records[0].UpdateV2, update)
 	if _, err := conn.HandleEncodedMessages(EncodeProtocolQueryAwareness()); !errors.Is(err, ErrAuthorityLost) {
 		t.Fatalf("conn.HandleEncodedMessages(query-awareness) error = %v, want %v", err, ErrAuthorityLost)
 	}

@@ -117,10 +117,14 @@ type ServerConfig struct {
 	// FanoutConcurrency limita quantos peers recebem o mesmo broadcast em
 	// paralelo. Valores <= 0 usam o padrão do pacote.
 	FanoutConcurrency int
-	// BootstrapOnConnect envia um bootstrap direto de sync + awareness quando o
+	// BootstrapOnConnect envia um bootstrap direto de awareness quando o
 	// WebSocket é aceito. É útil para clientes y-websocket receberem presença já
 	// conhecida sem aguardar o próximo heartbeat de awareness.
-	BootstrapOnConnect            bool
+	BootstrapOnConnect bool
+	// BootstrapSyncOnConnect inclui um SyncStep1 inicial no bootstrap. Use
+	// apenas quando o transporte não iniciar o handshake de sync por conta
+	// própria, pois documentos grandes podem gerar payloads e alocações altas.
+	BootstrapSyncOnConnect        bool
 	AuthorityRevalidationInterval time.Duration
 	Authenticator                 Authenticator
 	Authorizer                    Authorizer

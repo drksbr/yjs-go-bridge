@@ -671,11 +671,19 @@ func NewMessageFrame(message Message) (*Frame, error) {
 
 // EncodeMessageFrame serializa uma mensagem tipada como frame completo.
 func EncodeMessageFrame(message Message) ([]byte, error) {
-	frame, err := NewMessageFrame(message)
+	payload, err := EncodeMessagePayload(message)
 	if err != nil {
 		return nil, err
 	}
-	return EncodeFrame(frame)
+	header, err := NewHeader(message.Type(), message.FrameFlags(), len(payload))
+	if err != nil {
+		return nil, err
+	}
+	dst, err := AppendHeader(make([]byte, 0, HeaderSize+len(payload)), header)
+	if err != nil {
+		return nil, err
+	}
+	return append(dst, payload...), nil
 }
 
 // DecodeMessagePayload decodifica um payload tipado isolado para a mensagem
@@ -685,7 +693,8 @@ func DecodeMessagePayload(typ MessageType, flags Flags, payload []byte) (Message
 		return nil, fmt.Errorf("%w: %d", ErrUnknownMessageType, uint8(typ))
 	}
 
-	reader := ybinary.NewReader(payload)
+	readerValue := ybinary.NewReaderValue(payload)
+	reader := &readerValue
 	var (
 		message Message
 		err     error
@@ -749,6 +758,16 @@ func DecodeFrameMessage(frame *Frame) (Message, error) {
 // tipada contida nele.
 func DecodeMessageFrame(src []byte) (Message, error) {
 	frame, err := DecodeFrame(src)
+	if err != nil {
+		return nil, err
+	}
+	return DecodeFrameMessage(frame)
+}
+
+// DecodeMessageFrameView decodifica um frame completo sem copiar o payload do
+// frame antes de materializar a mensagem tipada.
+func DecodeMessageFrameView(src []byte) (Message, error) {
+	frame, err := DecodeFrameView(src)
 	if err != nil {
 		return nil, err
 	}

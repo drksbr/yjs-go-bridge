@@ -142,7 +142,7 @@ func readItemV2(decoder *decoderV2, info byte, id ytypes.ID) (ytypes.Struct, err
 		return nil, err
 	}
 
-	return ytypes.NewItem(id, content, ytypes.ItemOptions{
+	return ytypes.NewItemOwnedIDs(id, content, ytypes.ItemOptions{
 		Origin:      origin,
 		RightOrigin: rightOrigin,
 		Parent:      parent,

@@ -13,6 +13,12 @@ func NewReader(data []byte) *Reader {
 	return &Reader{data: data}
 }
 
+// NewReaderValue cria um leitor por valor para uso em structs hot-path, evitando
+// uma alocação separada quando o caller já possui o armazenamento do Reader.
+func NewReaderValue(data []byte) Reader {
+	return Reader{data: data}
+}
+
 // Offset retorna a posição atual de leitura no buffer.
 func (r *Reader) Offset() int {
 	return r.offset

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/storage"
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/yawareness"
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/yjsbridge"
@@ -86,7 +88,7 @@ type ConnectionHandleOptions struct {
 // - carrega o snapshot inicial do documento em `Open`;
 // - mantém o update V2 autoritativo do room em memória;
 // - deriva V1 apenas para compatibilidade, storage e update log existentes;
-// - replica updates e awareness entre conexões do mesmo documento;
+// - guarda awareness local por conexão e agrega snapshots por room;
 // - deixa transporte, fanout de rede e persistência automática fora de escopo.
 type Provider struct {
 	mu                    sync.Mutex
@@ -95,6 +97,7 @@ type Provider struct {
 	metrics               Metrics
 	storageMetrics        storage.Metrics
 	rooms                 map[storage.DocumentKey]*providerRoom
+	roomLoads             singleflight.Group
 }
 
 type providerRoom struct {
@@ -171,15 +174,6 @@ func (p *Provider) Open(ctx context.Context, key storage.DocumentKey, connection
 		id:       connectionID,
 		clientID: localClientID,
 		session:  NewSession(localClientID),
-	}
-	awareness := room.aggregateLocalAwarenessLocked(connectionID)
-	if len(awareness.Clients) > 0 {
-		if _, err := connection.session.HandleProtocolMessage(&ProtocolMessage{
-			Protocol:  ProtocolTypeAwareness,
-			Awareness: awareness,
-		}); err != nil {
-			return nil, err
-		}
 	}
 
 	room.connections[connectionID] = connection
@@ -464,7 +458,11 @@ func (c *Connection) Persist(ctx context.Context) (record *storage.SnapshotRecor
 		return nil, ErrPersistenceDisabled
 	}
 	key := c.room.key
-	snapshot := c.room.snapshot.Clone()
+	var snapshot *yjsbridge.PersistedSnapshot
+	if c.room.snapshot != nil {
+		snapshot = c.room.snapshot.Clone()
+	}
+	updateV2 := append([]byte(nil), c.room.updateV2...)
 	lastOffset := c.room.lastOffset
 	shouldTrim := lastOffset > c.room.compactedAt
 	compacted := storage.UpdateOffset(0)
@@ -479,6 +477,13 @@ func (c *Connection) Persist(ctx context.Context) (record *storage.SnapshotRecor
 			observePersist(c.provider.metrics, key, time.Since(start), lastOffset, compacted, err)
 		}
 	}()
+
+	if snapshot == nil {
+		snapshot, err = yjsbridge.DecodePersistedSnapshotV2Context(ctx, updateV2)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	record, err = c.provider.saveSnapshot(ctx, key, snapshot, lastOffset, authority)
 	if err != nil {
@@ -533,16 +538,6 @@ func (c *Connection) Close() (*DispatchResult, error) {
 			Protocol:  ProtocolTypeAwareness,
 			Awareness: tombstone,
 		}
-		for _, peer := range room.connections {
-			if peer.id == c.id || peer.closed {
-				continue
-			}
-			if _, err := peer.session.HandleProtocolMessage(message); err != nil {
-				room.mu.Unlock()
-				return nil, err
-			}
-		}
-
 		encoded, err := EncodeProtocolEnvelope(message)
 		if err != nil {
 			room.mu.Unlock()
@@ -581,6 +576,27 @@ func (p *Provider) ensureRoom(ctx context.Context, key storage.DocumentKey) (*pr
 	}
 	p.mu.Unlock()
 
+	loaded, err, _ := p.roomLoads.Do(providerRoomLoadKey(key), func() (any, error) {
+		p.mu.Lock()
+		if current, ok := p.rooms[key]; ok {
+			p.mu.Unlock()
+			return current, nil
+		}
+		p.mu.Unlock()
+
+		return p.loadRoom(ctx, key)
+	})
+	if err != nil {
+		return nil, err
+	}
+	room, ok = loaded.(*providerRoom)
+	if !ok || room == nil {
+		return nil, fmt.Errorf("yprotocol: room load retornou %T", loaded)
+	}
+	return room, nil
+}
+
+func (p *Provider) loadRoom(ctx context.Context, key storage.DocumentKey) (*providerRoom, error) {
 	authority, err := p.resolveRoomAuthority(ctx, key)
 	if err != nil {
 		if errors.Is(err, ErrAuthorityLost) {
@@ -598,9 +614,8 @@ func (p *Provider) ensureRoom(ctx context.Context, key storage.DocumentKey) (*pr
 		return nil, err
 	}
 
-	room = &providerRoom{
+	room := &providerRoom{
 		key:         key,
-		snapshot:    snapshot,
 		updateV2:    updateV2,
 		lastOffset:  lastOffset,
 		compactedAt: compactedAt,
@@ -616,6 +631,10 @@ func (p *Provider) ensureRoom(ctx context.Context, key storage.DocumentKey) (*pr
 	p.mu.Unlock()
 	observeRoomOpened(p.metrics, key)
 	return room, nil
+}
+
+func providerRoomLoadKey(key storage.DocumentKey) string {
+	return key.Namespace + "\x00" + key.DocumentID
 }
 
 func (p *Provider) loadSnapshot(ctx context.Context, key storage.DocumentKey) (*yjsbridge.PersistedSnapshot, storage.UpdateOffset, storage.UpdateOffset, error) {
@@ -838,14 +857,6 @@ func (r *providerRoom) handleMessageLocked(ctx context.Context, sender *Connecti
 		if _, err := sender.session.HandleProtocolMessage(message); err != nil {
 			return nil, nil, err
 		}
-		for _, peer := range r.connections {
-			if peer.id == sender.id || peer.closed {
-				continue
-			}
-			if _, err := peer.session.HandleProtocolMessage(message); err != nil {
-				return nil, nil, err
-			}
-		}
 		encoded, err := EncodeProtocolEnvelope(message)
 		if err != nil {
 			return nil, nil, err
@@ -874,15 +885,12 @@ func (r *providerRoom) applyDocumentPayloadLocked(ctx context.Context, provider 
 	if err != nil {
 		return nil, err
 	}
-	updateV1, err := yjsbridge.ConvertUpdateToV1YjsWire(updateV2)
-	if err != nil {
-		return nil, err
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
 	var appendedOffset storage.UpdateOffset
+	var updateV1 []byte
 	if provider != nil {
 		if updateStore := provider.updateLogStore(); updateStore != nil {
 			var (
@@ -893,11 +901,19 @@ func (r *providerRoom) applyDocumentPayloadLocked(ctx context.Context, provider 
 				if updateStoreV2, ok := provider.store.(storage.AuthoritativeUpdateLogStoreV2); ok {
 					record, err = updateStoreV2.AppendUpdateV2Authoritative(ctx, key, updateV2, *r.authority)
 				} else {
+					updateV1, err = yjsbridge.ConvertUpdateToV1YjsWire(updateV2)
+					if err != nil {
+						return nil, err
+					}
 					record, err = provider.authoritativeUpdateLogStore().AppendUpdateAuthoritative(ctx, key, updateV1, *r.authority)
 				}
 			} else if updateStoreV2, ok := updateStore.(storage.UpdateLogStoreV2); ok {
 				record, err = updateStoreV2.AppendUpdateV2(ctx, key, updateV2)
 			} else {
+				updateV1, err = yjsbridge.ConvertUpdateToV1YjsWire(updateV2)
+				if err != nil {
+					return nil, err
+				}
 				record, err = updateStore.AppendUpdate(ctx, key, updateV1)
 			}
 			if err != nil {
@@ -916,11 +932,7 @@ func (r *providerRoom) applyDocumentPayloadLocked(ctx context.Context, provider 
 		}
 	}
 
-	nextSnapshot, err := storage.ReplaySnapshot(ctx, r.snapshot, &storage.UpdateLogRecord{
-		Key:      key,
-		UpdateV2: updateV2,
-		UpdateV1: updateV1,
-	})
+	merged, err := yjsbridge.MergeUpdatesV2Context(ctx, r.updateV2, updateV2)
 	if err != nil {
 		if appendedOffset == 0 || provider == nil {
 			return nil, err
@@ -934,7 +946,7 @@ func (r *providerRoom) applyDocumentPayloadLocked(ctx context.Context, provider 
 		if updateErr != nil {
 			return nil, fmt.Errorf("rebuild room snapshot v2: %w", updateErr)
 		}
-		r.snapshot = recovered
+		r.snapshot = nil
 		r.updateV2 = recoveredUpdateV2
 		if lastOffset < appendedOffset {
 			lastOffset = appendedOffset
@@ -944,8 +956,8 @@ func (r *providerRoom) applyDocumentPayloadLocked(ctx context.Context, provider 
 		return r.updateV2, nil
 	}
 
-	r.snapshot = nextSnapshot
-	r.updateV2 = append([]byte(nil), nextSnapshot.UpdateV2...)
+	r.snapshot = nil
+	r.updateV2 = merged
 	if appendedOffset > 0 {
 		r.lastOffset = appendedOffset
 	}
@@ -954,7 +966,7 @@ func (r *providerRoom) applyDocumentPayloadLocked(ctx context.Context, provider 
 
 func persistedSnapshotUpdateV2(snapshot *yjsbridge.PersistedSnapshot) ([]byte, error) {
 	if snapshot != nil && len(snapshot.UpdateV2) != 0 {
-		return append([]byte(nil), snapshot.UpdateV2...), nil
+		return snapshot.UpdateV2, nil
 	}
 	updateV2, err := yjsbridge.EncodePersistedSnapshotV2(snapshot)
 	if err != nil {

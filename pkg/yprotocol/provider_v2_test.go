@@ -149,11 +149,15 @@ func TestConnectionHandleEncodedMessagesV2BroadcastOutputOptInKeepsStorageV1(t *
 	if len(records) != 1 {
 		t.Fatalf("len(records) = %d, want 1", len(records))
 	}
-	if !bytes.Equal(records[0].UpdateV1, v1Update) {
-		t.Fatalf("records[0].UpdateV1 = %x, want canonical V1 %x", records[0].UpdateV1, v1Update)
+	if len(records[0].UpdateV1) != 0 {
+		t.Fatalf("records[0].UpdateV1 = %x, want empty V2-only storage payload", records[0].UpdateV1)
 	}
-	if bytes.Equal(records[0].UpdateV1, v2Update) {
-		t.Fatalf("records[0].UpdateV1 preserved V2 bytes: %x", records[0].UpdateV1)
+	assertProtocolV2PayloadEquivalentToV1(t, records[0].UpdateV2, v1Update)
+	if bytes.Equal(records[0].UpdateV2, v1Update) {
+		t.Fatalf("records[0].UpdateV2 preserved V1 bytes: %x", records[0].UpdateV2)
+	}
+	if !bytes.Equal(records[0].UpdateV2, v2Update) {
+		t.Fatalf("records[0].UpdateV2 = %x, want canonical V2 %x", records[0].UpdateV2, v2Update)
 	}
 }
 

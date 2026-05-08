@@ -89,15 +89,20 @@ func TestProviderOpenLateJoinerLoadsLiveRoomState(t *testing.T) {
 		t.Fatalf("reply step2 payload = %v, want %v", replyMessages[0].Sync.Payload, expectedStep2)
 	}
 
-	preloadedAwareness, ok := lateJoiner.session.Awareness().Get(author.ClientID())
-	if !ok {
-		t.Fatal("lateJoiner.session.Awareness().Get() = missing, want preloaded author awareness")
+	awarenessReply, err := lateJoiner.HandleEncodedMessages(EncodeProtocolQueryAwareness())
+	if err != nil {
+		t.Fatalf("lateJoiner.HandleEncodedMessages(query-awareness) unexpected error: %v", err)
 	}
-	if preloadedAwareness.Clock != 1 {
-		t.Fatalf("preloaded awareness clock = %d, want 1", preloadedAwareness.Clock)
+	awarenessMessages, err := DecodeProtocolMessages(awarenessReply.Direct)
+	if err != nil {
+		t.Fatalf("DecodeProtocolMessages(awareness reply) unexpected error: %v", err)
 	}
-	if !bytes.Equal(preloadedAwareness.State, presenceState) {
-		t.Fatalf("preloaded awareness state = %s, want %s", preloadedAwareness.State, presenceState)
+	if len(awarenessMessages) != 1 || awarenessMessages[0].Awareness == nil {
+		t.Fatalf("awarenessMessages = %#v, want single awareness response", awarenessMessages)
+	}
+	awarenessStates := awarenessStatesByClient(awarenessMessages[0].Awareness)
+	if !bytes.Equal(awarenessStates[author.ClientID()], presenceState) {
+		t.Fatalf("late join awareness state = %s, want %s", awarenessStates[author.ClientID()], presenceState)
 	}
 }
 
@@ -208,16 +213,6 @@ func TestProviderHandleEncodedMessagesBatchedEnvelope(t *testing.T) {
 	}
 
 	assertConnectionSyncStep2EquivalentToV1(t, peer, update)
-	peerAwareness, ok := peer.session.Awareness().Get(sender.ClientID())
-	if !ok {
-		t.Fatal("peer.session.Awareness().Get() = missing, want sender awareness applied from batch")
-	}
-	if peerAwareness.Clock != 1 {
-		t.Fatalf("peer awareness clock = %d, want 1", peerAwareness.Clock)
-	}
-	if !bytes.Equal(peerAwareness.State, presenceState) {
-		t.Fatalf("peer awareness state = %s, want %s", peerAwareness.State, presenceState)
-	}
 }
 
 func TestProviderSyncUpdateNormalizesV2BroadcastAndRoomState(t *testing.T) {

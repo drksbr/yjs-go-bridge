@@ -50,6 +50,17 @@ type Item struct {
 // NewItem valida o conteúdo, deriva o comprimento e normaliza o bit de
 // countable para refletir o comportamento do Yjs.
 func NewItem(id ID, content Content, opts ItemOptions) (*Item, error) {
+	return newItem(id, content, opts, true)
+}
+
+// NewItemOwnedIDs cria um item assumindo ownership dos ponteiros de ID em opts.
+// Use apenas quando os IDs foram recém-materializados para este item e não serão
+// mutados pelo caller.
+func NewItemOwnedIDs(id ID, content Content, opts ItemOptions) (*Item, error) {
+	return newItem(id, content, opts, false)
+}
+
+func newItem(id ID, content Content, opts ItemOptions, cloneIDs bool) (*Item, error) {
 	if content == nil {
 		return nil, ErrNilContent
 	}
@@ -64,13 +75,22 @@ func NewItem(id ID, content Content, opts ItemOptions) (*Item, error) {
 		info |= ItemFlagCountable
 	}
 
+	origin := opts.Origin
+	rightOrigin := opts.RightOrigin
+	redone := opts.Redone
+	if cloneIDs {
+		origin = cloneID(origin)
+		rightOrigin = cloneID(rightOrigin)
+		redone = cloneID(redone)
+	}
+
 	return &Item{
 		baseStruct:  base,
-		Origin:      cloneID(opts.Origin),
-		RightOrigin: cloneID(opts.RightOrigin),
+		Origin:      origin,
+		RightOrigin: rightOrigin,
 		Parent:      opts.Parent,
 		ParentSub:   opts.ParentSub,
-		Redone:      cloneID(opts.Redone),
+		Redone:      redone,
 		Info:        info,
 		Content:     content,
 	}, nil

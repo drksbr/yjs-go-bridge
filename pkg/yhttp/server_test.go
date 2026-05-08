@@ -286,6 +286,11 @@ func TestHTTPServerSyncOutputFormatV2OptIn(t *testing.T) {
 	left := dialWS(t, srv.URL+"/ws?doc=room-v2-output&client=451&conn=left")
 	right := dialWS(t, srv.URL+"/ws?doc=room-v2-output&client=452&conn=right&sync=v2")
 
+	writeBinary(t, left, yprotocol.EncodeProtocolSyncStep1([]byte{0x00}))
+	_ = readBinary(t, left)
+	writeBinary(t, right, yprotocol.EncodeProtocolSyncStep1([]byte{0x00}))
+	_ = readBinary(t, right)
+
 	update := buildGCOnlyUpdate(91, 3)
 	writeBinary(t, left, yprotocol.EncodeProtocolSyncUpdate(update))
 

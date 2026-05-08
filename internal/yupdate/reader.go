@@ -228,7 +228,7 @@ func (r *LazyReaderV1) readItem(info byte) (ytypes.Struct, error) {
 		return nil, err
 	}
 
-	item, err := ytypes.NewItem(id, content, ytypes.ItemOptions{
+	item, err := ytypes.NewItemOwnedIDs(id, content, ytypes.ItemOptions{
 		Origin:      origin,
 		RightOrigin: rightOrigin,
 		Parent:      parent,

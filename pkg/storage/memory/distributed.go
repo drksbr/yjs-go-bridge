@@ -53,11 +53,7 @@ func (s *Store) AppendUpdate(ctx context.Context, key storage.DocumentKey, updat
 
 // AppendUpdateV2 adiciona um update V2 ao fim do log incremental do documento.
 func (s *Store) AppendUpdateV2(ctx context.Context, key storage.DocumentKey, update []byte) (*storage.UpdateLogRecord, error) {
-	updateV1, err := yjsbridge.ConvertUpdateToV1(update)
-	if err != nil {
-		return nil, err
-	}
-	return s.appendUpdateV2(ctx, key, update, updateV1, 0, nil)
+	return s.appendUpdateV2(ctx, key, update, 0, nil)
 }
 
 // AppendUpdateAuthoritative adiciona um update V1 ao fim do log incremental do
@@ -110,18 +106,13 @@ func (s *Store) AppendUpdateV2Authoritative(
 	update []byte,
 	fence storage.AuthorityFence,
 ) (*storage.UpdateLogRecord, error) {
-	updateV1, err := yjsbridge.ConvertUpdateToV1(update)
-	if err != nil {
-		return nil, err
-	}
-	return s.appendUpdateV2(ctx, key, update, updateV1, fence.Owner.Epoch, &fence)
+	return s.appendUpdateV2(ctx, key, update, fence.Owner.Epoch, &fence)
 }
 
 func (s *Store) appendUpdateV2(
 	ctx context.Context,
 	key storage.DocumentKey,
 	updateV2 []byte,
-	updateV1 []byte,
 	epoch uint64,
 	fence *storage.AuthorityFence,
 ) (*storage.UpdateLogRecord, error) {
@@ -154,7 +145,7 @@ func (s *Store) appendUpdateV2(
 		}
 	}
 	offset := s.updateNext[key] + 1
-	record := newUpdateLogRecord(key, offset, updateV1, updateV2, epoch, now)
+	record := newUpdateLogRecord(key, offset, nil, updateV2, epoch, now)
 	s.updateLogs[key] = append(s.updateLogs[key], record)
 	s.updateNext[key] = offset
 	return record.Clone(), nil
@@ -205,14 +196,12 @@ func (s *Store) ListUpdates(ctx context.Context, key storage.DocumentKey, after 
 	if limit > 0 && limit < maxResults {
 		maxResults = limit
 	}
-	selected := make([]*storage.UpdateLogRecord, maxResults)
-	copy(selected, records[start:start+maxResults])
-	s.mu.RUnlock()
 
-	result := make([]*storage.UpdateLogRecord, len(selected))
-	for idx, record := range selected {
+	result := make([]*storage.UpdateLogRecord, maxResults)
+	for idx, record := range records[start : start+maxResults] {
 		result[idx] = record.Clone()
 	}
+	s.mu.RUnlock()
 	return result, nil
 }
 
@@ -319,12 +308,6 @@ func trimUpdateLogRecordPointers(records []*storage.UpdateLogRecord, firstRemain
 	if firstRemaining >= len(records) {
 		return nil
 	}
-	if firstRemaining <= len(records)/4 {
-		for idx := 0; idx < firstRemaining; idx++ {
-			records[idx] = nil
-		}
-		return records[firstRemaining:]
-	}
 	return cloneUpdateLogRecordPointers(records[firstRemaining:])
 }
 
@@ -387,21 +370,25 @@ func (s *Store) ListPlacements(ctx context.Context, opts storage.PlacementListOp
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	records := make([]*storage.PlacementRecord, 0, len(s.placements))
+	selected := make([]*storage.PlacementRecord, 0, len(s.placements))
 	for _, record := range s.placements {
 		if opts.Namespace != "" && record.Key.Namespace != opts.Namespace {
 			continue
 		}
-		records = append(records, record.Clone())
+		selected = append(selected, record)
 	}
-	sort.Slice(records, func(i, j int) bool {
-		if records[i].Key.Namespace != records[j].Key.Namespace {
-			return records[i].Key.Namespace < records[j].Key.Namespace
+	sort.Slice(selected, func(i, j int) bool {
+		if selected[i].Key.Namespace != selected[j].Key.Namespace {
+			return selected[i].Key.Namespace < selected[j].Key.Namespace
 		}
-		return records[i].Key.DocumentID < records[j].Key.DocumentID
+		return selected[i].Key.DocumentID < selected[j].Key.DocumentID
 	})
-	if opts.Limit > 0 && len(records) > opts.Limit {
-		records = records[:opts.Limit]
+	if opts.Limit > 0 && len(selected) > opts.Limit {
+		selected = selected[:opts.Limit]
+	}
+	records := make([]*storage.PlacementRecord, len(selected))
+	for idx, record := range selected {
+		records[idx] = record.Clone()
 	}
 	return records, nil
 }

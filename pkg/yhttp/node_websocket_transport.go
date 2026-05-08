@@ -145,7 +145,7 @@ func (s *webSocketNodeMessageStream) Receive(ctx context.Context) (ynodeproto.Me
 		_ = s.conn.Close(websocket.StatusUnsupportedData, "yjs-crdt-golang-server aceita apenas frames binarios")
 		return nil, fmt.Errorf("yhttp: node stream recebeu frame nao-binario: %v", msgType)
 	}
-	return ynodeproto.DecodeMessageFrame(payload)
+	return ynodeproto.DecodeMessageFrameView(payload)
 }
 
 func (s *webSocketNodeMessageStream) Close() error {

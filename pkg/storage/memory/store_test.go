@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/drksbr/yjs-crdt-golang-server/internal/varint"
+	"github.com/drksbr/yjs-crdt-golang-server/internal/ytypes"
+	"github.com/drksbr/yjs-crdt-golang-server/internal/yupdate"
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/storage"
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/yjsbridge"
 )
@@ -16,15 +19,16 @@ import (
 func TestStoreSaveAndLoadSnapshot(t *testing.T) {
 	t.Parallel()
 
-	baseSnapshot, err := yjsbridge.PersistedSnapshotFromUpdates()
+	firstSnapshot, err := yjsbridge.PersistedSnapshotFromUpdates(buildMemoryStoreGCOnlyUpdate(1, 1))
 	if err != nil {
-		t.Fatalf("PersistedSnapshotFromUpdates() unexpected error: %v", err)
+		t.Fatalf("PersistedSnapshotFromUpdates(first) unexpected error: %v", err)
 	}
-
-	first := baseSnapshot.Clone()
-	first.UpdateV1 = []byte{0x01}
-	second := baseSnapshot.Clone()
-	second.UpdateV1 = []byte{0x02}
+	secondSnapshot, err := yjsbridge.PersistedSnapshotFromUpdates(buildMemoryStoreGCOnlyUpdate(2, 1))
+	if err != nil {
+		t.Fatalf("PersistedSnapshotFromUpdates(second) unexpected error: %v", err)
+	}
+	first := firstSnapshot.Clone()
+	second := secondSnapshot.Clone()
 
 	tests := []struct {
 		name       string
@@ -445,4 +449,14 @@ func sequenceClock(times ...time.Time) func() time.Time {
 		index++
 		return value
 	}
+}
+
+func buildMemoryStoreGCOnlyUpdate(client, length uint32) []byte {
+	update := varint.Append(nil, 1)
+	update = varint.Append(update, 1)
+	update = varint.Append(update, client)
+	update = varint.Append(update, 0)
+	update = append(update, 0)
+	update = varint.Append(update, length)
+	return append(update, yupdate.EncodeDeleteSetBlockV1(ytypes.NewDeleteSet())...)
 }

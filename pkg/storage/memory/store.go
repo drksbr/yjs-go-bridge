@@ -13,12 +13,20 @@ import (
 type Store struct {
 	mu         sync.RWMutex
 	now        func() time.Time
-	items      map[storage.DocumentKey]*storage.SnapshotRecord
+	items      map[storage.DocumentKey]*memorySnapshotRecord
 	updateLogs map[storage.DocumentKey][]*storage.UpdateLogRecord
 	updateNext map[storage.DocumentKey]storage.UpdateOffset
 	placements map[storage.DocumentKey]*storage.PlacementRecord
 	leases     map[storage.ShardID]*storage.LeaseRecord
 	leaseLast  map[storage.ShardID]uint64
+}
+
+type memorySnapshotRecord struct {
+	key      storage.DocumentKey
+	updateV2 []byte
+	through  storage.UpdateOffset
+	epoch    uint64
+	storedAt time.Time
 }
 
 var _ storage.SnapshotStore = (*Store)(nil)
@@ -30,7 +38,7 @@ var _ storage.AuthoritativeSnapshotCheckpointStore = (*Store)(nil)
 // New cria um store em memória pronto para uso.
 func New() *Store {
 	return &Store{
-		items:      make(map[storage.DocumentKey]*storage.SnapshotRecord),
+		items:      make(map[storage.DocumentKey]*memorySnapshotRecord),
 		updateLogs: make(map[storage.DocumentKey][]*storage.UpdateLogRecord),
 		updateNext: make(map[storage.DocumentKey]storage.UpdateOffset),
 		placements: make(map[storage.DocumentKey]*storage.PlacementRecord),
@@ -66,21 +74,18 @@ func (s *Store) SaveSnapshotCheckpointEpoch(ctx context.Context, key storage.Doc
 	if snapshot == nil {
 		return nil, storage.ErrNilPersistedSnapshot
 	}
-
-	record := &storage.SnapshotRecord{
-		Key:      key,
-		Snapshot: snapshot.Clone(),
-		Through:  through,
-		Epoch:    epoch,
-		StoredAt: s.nowTime(),
+	updateV2, err := yjsbridge.EncodePersistedSnapshotV2(snapshot)
+	if err != nil {
+		return nil, err
 	}
+	storedAt := s.nowTime()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.ensureStoreInitializedLocked()
-	s.items[key] = record
-	return record.Clone(), nil
+	s.items[key] = newMemorySnapshotRecord(key, updateV2, through, epoch, storedAt)
+	return snapshotRecordFromSnapshot(key, snapshot, through, epoch, storedAt), nil
 }
 
 // SaveSnapshotAuthoritative grava ou substitui o snapshot associado à chave,
@@ -118,24 +123,22 @@ func (s *Store) SaveSnapshotCheckpointAuthoritative(
 	if err := fence.Validate(); err != nil {
 		return nil, err
 	}
-
-	record := &storage.SnapshotRecord{
-		Key:      key,
-		Snapshot: snapshot.Clone(),
-		Through:  through,
-		Epoch:    fence.Owner.Epoch,
-		StoredAt: s.nowTime(),
+	updateV2, err := yjsbridge.EncodePersistedSnapshotV2(snapshot)
+	if err != nil {
+		return nil, err
 	}
+	storedAt := s.nowTime()
+	epoch := fence.Owner.Epoch
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.ensureStoreInitializedLocked()
-	if err := s.validateAuthorityLocked(key, fence, record.StoredAt); err != nil {
+	if err := s.validateAuthorityLocked(key, fence, storedAt); err != nil {
 		return nil, err
 	}
-	s.items[key] = record
-	return record.Clone(), nil
+	s.items[key] = newMemorySnapshotRecord(key, updateV2, through, epoch, storedAt)
+	return snapshotRecordFromSnapshot(key, snapshot, through, epoch, storedAt), nil
 }
 
 // LoadSnapshot carrega o snapshot atual associado à chave.
@@ -151,18 +154,19 @@ func (s *Store) LoadSnapshot(ctx context.Context, key storage.DocumentKey) (*sto
 	}
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	record, ok := s.items[key]
 	if !ok {
+		s.mu.RUnlock()
 		return nil, storage.ErrSnapshotNotFound
 	}
-	return record.Clone(), nil
+	loaded := record.clone()
+	s.mu.RUnlock()
+	return loaded.toSnapshotRecord(ctx)
 }
 
 func (s *Store) ensureStoreInitializedLocked() {
 	if s.items == nil {
-		s.items = make(map[storage.DocumentKey]*storage.SnapshotRecord)
+		s.items = make(map[storage.DocumentKey]*memorySnapshotRecord)
 	}
 	if s.updateLogs == nil {
 		s.updateLogs = make(map[storage.DocumentKey][]*storage.UpdateLogRecord)
@@ -181,6 +185,62 @@ func (s *Store) ensureStoreInitializedLocked() {
 	}
 	if s.now == nil {
 		s.now = func() time.Time { return time.Now().UTC() }
+	}
+}
+
+func newMemorySnapshotRecord(
+	key storage.DocumentKey,
+	updateV2 []byte,
+	through storage.UpdateOffset,
+	epoch uint64,
+	storedAt time.Time,
+) *memorySnapshotRecord {
+	return &memorySnapshotRecord{
+		key:      key,
+		updateV2: append([]byte(nil), updateV2...),
+		through:  through,
+		epoch:    epoch,
+		storedAt: storedAt,
+	}
+}
+
+func (r *memorySnapshotRecord) clone() *memorySnapshotRecord {
+	if r == nil {
+		return nil
+	}
+	return newMemorySnapshotRecord(r.key, r.updateV2, r.through, r.epoch, r.storedAt)
+}
+
+func (r *memorySnapshotRecord) toSnapshotRecord(ctx context.Context) (*storage.SnapshotRecord, error) {
+	if r == nil {
+		return nil, storage.ErrSnapshotNotFound
+	}
+	snapshot, err := yjsbridge.DecodePersistedSnapshotV2Context(ctx, r.updateV2)
+	if err != nil {
+		return nil, err
+	}
+	return &storage.SnapshotRecord{
+		Key:      r.key,
+		Snapshot: snapshot,
+		Through:  r.through,
+		Epoch:    r.epoch,
+		StoredAt: r.storedAt,
+	}, nil
+}
+
+func snapshotRecordFromSnapshot(
+	key storage.DocumentKey,
+	snapshot *yjsbridge.PersistedSnapshot,
+	through storage.UpdateOffset,
+	epoch uint64,
+	storedAt time.Time,
+) *storage.SnapshotRecord {
+	return &storage.SnapshotRecord{
+		Key:      key,
+		Snapshot: snapshot.Clone(),
+		Through:  through,
+		Epoch:    epoch,
+		StoredAt: storedAt,
 	}
 }
 

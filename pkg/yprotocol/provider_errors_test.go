@@ -270,15 +270,20 @@ func TestConnectionCloseBroadcastsAwarenessTombstone(t *testing.T) {
 		}
 	})
 
-	before, ok := listener.session.Awareness().Get(publisher.ClientID())
-	if !ok {
-		t.Fatal("listener.session.Awareness().Get() = missing, want publisher awareness before close")
+	queryBeforeClose, err := listener.HandleEncodedMessages(EncodeProtocolQueryAwareness())
+	if err != nil {
+		t.Fatalf("listener.HandleEncodedMessages(query-awareness) unexpected error: %v", err)
 	}
-	if !bytes.Equal(before.State, []byte(`{"name":"alice","cursor":1}`)) {
-		t.Fatalf("before.State = %s, want publisher awareness payload", before.State)
+	queryMessages, err := DecodeProtocolMessages(queryBeforeClose.Direct)
+	if err != nil {
+		t.Fatalf("DecodeProtocolMessages(query before close) unexpected error: %v", err)
 	}
-	if before.Clock != 0 {
-		t.Fatalf("before.Clock = %d, want 0", before.Clock)
+	if len(queryMessages) != 1 || queryMessages[0].Awareness == nil {
+		t.Fatalf("queryMessages = %#v, want single awareness response", queryMessages)
+	}
+	beforeStates := awarenessStatesByClient(queryMessages[0].Awareness)
+	if !bytes.Equal(beforeStates[publisher.ClientID()], []byte(`{"name":"alice","cursor":1}`)) {
+		t.Fatalf("publisher awareness state = %s, want publisher awareness payload", beforeStates[publisher.ClientID()])
 	}
 
 	result, err := publisher.Close()
@@ -314,23 +319,20 @@ func TestConnectionCloseBroadcastsAwarenessTombstone(t *testing.T) {
 		t.Fatalf("tombstone = %#v, want null awareness state", tombstone)
 	}
 
-	if _, ok := listener.session.Awareness().Get(publisher.ClientID()); ok {
-		t.Fatal("listener.session.Awareness().Get() = present after close, want tombstoned publisher removed")
+	queryAfterClose, err := listener.HandleEncodedMessages(EncodeProtocolQueryAwareness())
+	if err != nil {
+		t.Fatalf("listener.HandleEncodedMessages(query-awareness after close) unexpected error: %v", err)
 	}
-	meta, ok := listener.session.Awareness().Meta(publisher.ClientID())
-	if !ok {
-		t.Fatal("listener.session.Awareness().Meta() = missing, want preserved tombstone metadata")
+	afterMessages, err := DecodeProtocolMessages(queryAfterClose.Direct)
+	if err != nil {
+		t.Fatalf("DecodeProtocolMessages(query after close) unexpected error: %v", err)
 	}
-	if meta.Clock != 1 {
-		t.Fatalf("listener.session.Awareness().Meta().Clock = %d, want 1", meta.Clock)
+	if len(afterMessages) != 1 || afterMessages[0].Awareness == nil {
+		t.Fatalf("afterMessages = %#v, want single awareness response", afterMessages)
 	}
-
-	update := listener.session.Awareness().UpdateForClients([]uint32{publisher.ClientID()})
-	if len(update.Clients) != 1 {
-		t.Fatalf("len(UpdateForClients) = %d, want 1 tombstone client", len(update.Clients))
-	}
-	if !update.Clients[0].IsNull() || update.Clients[0].Clock != 1 {
-		t.Fatalf("UpdateForClients() = %+v, want single tombstone clock=1", update.Clients)
+	afterStates := awarenessStatesByClient(afterMessages[0].Awareness)
+	if _, ok := afterStates[publisher.ClientID()]; ok {
+		t.Fatal("query-awareness includes closed publisher, want removed")
 	}
 }
 

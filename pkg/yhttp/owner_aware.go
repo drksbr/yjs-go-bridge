@@ -179,6 +179,7 @@ func (s *OwnerAwareServer) serveLocalOwner(w http.ResponseWriter, r *http.Reques
 	s.local.serveResolvedHTTPWithOptions(w, r, req, serverSocketSessionOptions{
 		observeConnectionLifecycle: true,
 		bootstrap:                  s.local.bootstrapOnConnect,
+		bootstrapSync:              s.local.bootstrapSyncOnConnect,
 		authorityLossHandler:       s.onLocalAuthorityLost,
 	})
 }

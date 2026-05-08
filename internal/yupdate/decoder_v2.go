@@ -10,7 +10,7 @@ import (
 )
 
 type decoderV2 struct {
-	rest       *ybinary.Reader
+	rest       ybinary.Reader
 	keyClock   *intDiffOptRleDecoder
 	client     *uintOptRleDecoder
 	leftClock  *intDiffOptRleDecoder
@@ -25,8 +25,8 @@ type decoderV2 struct {
 }
 
 func newDecoderV2(data []byte) (*decoderV2, error) {
-	reader := ybinary.NewReader(data)
-	featureFlag, err := readLib0VarUint(reader, "ReadV2FeatureFlag")
+	reader := ybinary.NewReaderValue(data)
+	featureFlag, err := readLib0VarUint(&reader, "ReadV2FeatureFlag")
 	if err != nil {
 		return nil, err
 	}
@@ -34,39 +34,39 @@ func newDecoderV2(data []byte) (*decoderV2, error) {
 		return nil, unsupportedV2FeatureFlag(featureFlag)
 	}
 
-	keyClockData, err := readLib0VarUint8ArrayView(reader, "ReadV2KeyClockEncoder")
+	keyClockData, err := readLib0VarUint8ArrayView(&reader, "ReadV2KeyClockEncoder")
 	if err != nil {
 		return nil, err
 	}
-	clientData, err := readLib0VarUint8ArrayView(reader, "ReadV2ClientEncoder")
+	clientData, err := readLib0VarUint8ArrayView(&reader, "ReadV2ClientEncoder")
 	if err != nil {
 		return nil, err
 	}
-	leftClockData, err := readLib0VarUint8ArrayView(reader, "ReadV2LeftClockEncoder")
+	leftClockData, err := readLib0VarUint8ArrayView(&reader, "ReadV2LeftClockEncoder")
 	if err != nil {
 		return nil, err
 	}
-	rightClockData, err := readLib0VarUint8ArrayView(reader, "ReadV2RightClockEncoder")
+	rightClockData, err := readLib0VarUint8ArrayView(&reader, "ReadV2RightClockEncoder")
 	if err != nil {
 		return nil, err
 	}
-	infoData, err := readLib0VarUint8ArrayView(reader, "ReadV2InfoEncoder")
+	infoData, err := readLib0VarUint8ArrayView(&reader, "ReadV2InfoEncoder")
 	if err != nil {
 		return nil, err
 	}
-	stringData, err := readLib0VarUint8ArrayView(reader, "ReadV2StringEncoder")
+	stringData, err := readLib0VarUint8ArrayView(&reader, "ReadV2StringEncoder")
 	if err != nil {
 		return nil, err
 	}
-	parentInfoData, err := readLib0VarUint8ArrayView(reader, "ReadV2ParentInfoEncoder")
+	parentInfoData, err := readLib0VarUint8ArrayView(&reader, "ReadV2ParentInfoEncoder")
 	if err != nil {
 		return nil, err
 	}
-	typeRefData, err := readLib0VarUint8ArrayView(reader, "ReadV2TypeRefEncoder")
+	typeRefData, err := readLib0VarUint8ArrayView(&reader, "ReadV2TypeRefEncoder")
 	if err != nil {
 		return nil, err
 	}
-	lengthData, err := readLib0VarUint8ArrayView(reader, "ReadV2LenEncoder")
+	lengthData, err := readLib0VarUint8ArrayView(&reader, "ReadV2LenEncoder")
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +81,7 @@ func newDecoderV2(data []byte) (*decoderV2, error) {
 	}
 
 	return &decoderV2{
-		rest:       ybinary.NewReader(restData),
+		rest:       ybinary.NewReaderValue(restData),
 		keyClock:   newIntDiffOptRleDecoder(keyClockData, "ReadV2KeyClock"),
 		client:     newUintOptRleDecoder(clientData, "ReadV2Client"),
 		leftClock:  newIntDiffOptRleDecoder(leftClockData, "ReadV2LeftClock"),
@@ -134,7 +134,7 @@ func (d *decoderV2) ensureDrained() error {
 }
 
 func (d *decoderV2) readRestVarUint(op string) (uint32, error) {
-	return readLib0VarUint(d.rest, op)
+	return readLib0VarUint(&d.rest, op)
 }
 
 func (d *decoderV2) readClient() (uint32, error) {
@@ -214,15 +214,15 @@ func (d *decoderV2) readKey() (string, error) {
 }
 
 func (d *decoderV2) readBuf(op string) ([]byte, error) {
-	return readLib0VarUint8ArrayView(d.rest, op)
+	return readLib0VarUint8ArrayView(&d.rest, op)
 }
 
 func (d *decoderV2) readVarString(op string) (string, error) {
-	return readLib0VarString(d.rest, op)
+	return readLib0VarString(&d.rest, op)
 }
 
 func (d *decoderV2) readVarIntRaw(op string) ([]byte, error) {
-	return readLib0VarIntRaw(d.rest, op)
+	return readLib0VarIntRaw(&d.rest, op)
 }
 
 func (d *decoderV2) readAnyRaw(op string) ([]byte, error) {
@@ -246,13 +246,13 @@ func (d *decoderV2) readAnyRawWithTag(op string, start int, tag byte) ([]byte, e
 		}
 		return append(raw, value...), nil
 	case 124:
-		value, err := readLib0BigEndian(d.rest, op+".float32", 4)
+		value, err := readLib0BigEndian(&d.rest, op+".float32", 4)
 		if err != nil {
 			return nil, err
 		}
 		return append(raw, value...), nil
 	case 123, 122:
-		value, err := readLib0BigEndian(d.rest, op+".float64", 8)
+		value, err := readLib0BigEndian(&d.rest, op+".float64", 8)
 		if err != nil {
 			return nil, err
 		}

@@ -191,8 +191,8 @@ func TestStoreAppendUpdateV2PreservesCanonicalPayload(t *testing.T) {
 	if !bytes.Equal(record.UpdateV2, updateV2) {
 		t.Fatalf("AppendUpdateV2().UpdateV2 = %v, want %v", record.UpdateV2, updateV2)
 	}
-	if len(record.UpdateV1) == 0 {
-		t.Fatal("AppendUpdateV2().UpdateV1 is empty, want compatibility payload")
+	if len(record.UpdateV1) != 0 {
+		t.Fatalf("AppendUpdateV2().UpdateV1 = %v, want empty V2-only storage payload", record.UpdateV1)
 	}
 
 	records, err := store.ListUpdates(context.Background(), key, 0, 0)
@@ -204,6 +204,9 @@ func TestStoreAppendUpdateV2PreservesCanonicalPayload(t *testing.T) {
 	}
 	if !bytes.Equal(records[0].UpdateV2, updateV2) {
 		t.Fatalf("ListUpdates()[0].UpdateV2 = %v, want %v", records[0].UpdateV2, updateV2)
+	}
+	if len(records[0].UpdateV1) != 0 {
+		t.Fatalf("ListUpdates()[0].UpdateV1 = %v, want empty V2-only storage payload", records[0].UpdateV1)
 	}
 	records[0].UpdateV2[0] ^= 0xff
 	reloaded, err := store.ListUpdates(context.Background(), key, 0, 0)

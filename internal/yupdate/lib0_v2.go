@@ -4,25 +4,26 @@ import (
 	"fmt"
 	"math"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	ybinary "github.com/drksbr/yjs-crdt-golang-server/internal/binary"
 	"github.com/drksbr/yjs-crdt-golang-server/internal/varint"
 )
 
 type uintOptRleDecoder struct {
-	reader *ybinary.Reader
+	reader ybinary.Reader
 	value  uint32
 	count  int64
 	op     string
 }
 
 func newUintOptRleDecoder(data []byte, op string) *uintOptRleDecoder {
-	return &uintOptRleDecoder{reader: ybinary.NewReader(data), op: op}
+	return &uintOptRleDecoder{reader: ybinary.NewReaderValue(data), op: op}
 }
 
 func (d *uintOptRleDecoder) read() (uint32, error) {
 	if d.count == 0 {
-		value, negative, err := readLib0VarInt(d.reader, d.op+".value")
+		value, negative, err := readLib0VarInt(&d.reader, d.op+".value")
 		if err != nil {
 			return 0, err
 		}
@@ -36,7 +37,7 @@ func (d *uintOptRleDecoder) read() (uint32, error) {
 		d.value = uint32(value)
 		d.count = 1
 		if negative {
-			count, err := readLib0VarUint(d.reader, d.op+".count")
+			count, err := readLib0VarUint(&d.reader, d.op+".count")
 			if err != nil {
 				return 0, err
 			}
@@ -49,7 +50,7 @@ func (d *uintOptRleDecoder) read() (uint32, error) {
 }
 
 func (d *uintOptRleDecoder) ensureDrained() error {
-	if d == nil || d.reader == nil {
+	if d == nil {
 		return nil
 	}
 	if d.count > 0 || d.reader.Remaining() != 0 {
@@ -59,7 +60,7 @@ func (d *uintOptRleDecoder) ensureDrained() error {
 }
 
 type intDiffOptRleDecoder struct {
-	reader *ybinary.Reader
+	reader ybinary.Reader
 	value  int64
 	diff   int64
 	count  int64
@@ -67,12 +68,12 @@ type intDiffOptRleDecoder struct {
 }
 
 func newIntDiffOptRleDecoder(data []byte, op string) *intDiffOptRleDecoder {
-	return &intDiffOptRleDecoder{reader: ybinary.NewReader(data), op: op}
+	return &intDiffOptRleDecoder{reader: ybinary.NewReaderValue(data), op: op}
 }
 
 func (d *intDiffOptRleDecoder) read() (uint32, error) {
 	if d.count == 0 {
-		encodedDiff, _, err := readLib0VarInt(d.reader, d.op+".diff")
+		encodedDiff, _, err := readLib0VarInt(&d.reader, d.op+".diff")
 		if err != nil {
 			return 0, err
 		}
@@ -81,7 +82,7 @@ func (d *intDiffOptRleDecoder) read() (uint32, error) {
 		d.diff = floorDiv2(encodedDiff)
 		d.count = 1
 		if hasCount {
-			count, err := readLib0VarUint(d.reader, d.op+".count")
+			count, err := readLib0VarUint(&d.reader, d.op+".count")
 			if err != nil {
 				return 0, err
 			}
@@ -98,7 +99,7 @@ func (d *intDiffOptRleDecoder) read() (uint32, error) {
 }
 
 func (d *intDiffOptRleDecoder) ensureDrained() error {
-	if d == nil || d.reader == nil {
+	if d == nil {
 		return nil
 	}
 	if d.count > 0 || d.reader.Remaining() != 0 {
@@ -108,14 +109,14 @@ func (d *intDiffOptRleDecoder) ensureDrained() error {
 }
 
 type rleByteDecoder struct {
-	reader *ybinary.Reader
+	reader ybinary.Reader
 	value  byte
 	count  int64
 	op     string
 }
 
 func newRleByteDecoder(data []byte, op string) *rleByteDecoder {
-	return &rleByteDecoder{reader: ybinary.NewReader(data), op: op}
+	return &rleByteDecoder{reader: ybinary.NewReaderValue(data), op: op}
 }
 
 func (d *rleByteDecoder) read() (byte, error) {
@@ -126,7 +127,7 @@ func (d *rleByteDecoder) read() (byte, error) {
 		}
 		d.value = value
 		if d.reader.Remaining() > 0 {
-			count, err := readLib0VarUint(d.reader, d.op+".count")
+			count, err := readLib0VarUint(&d.reader, d.op+".count")
 			if err != nil {
 				return 0, err
 			}
@@ -141,7 +142,7 @@ func (d *rleByteDecoder) read() (byte, error) {
 }
 
 func (d *rleByteDecoder) ensureDrained() error {
-	if d == nil || d.reader == nil {
+	if d == nil {
 		return nil
 	}
 	if d.count > 0 || d.reader.Remaining() != 0 {
@@ -152,14 +153,15 @@ func (d *rleByteDecoder) ensureDrained() error {
 
 type stringDecoderV2 struct {
 	lengths *uintOptRleDecoder
+	table   string
 	units   []uint16
 	pos     int
 	op      string
 }
 
 func newStringDecoderV2(data []byte, op string) (*stringDecoderV2, error) {
-	reader := ybinary.NewReader(data)
-	value, err := readLib0VarString(reader, op+".table")
+	reader := ybinary.NewReaderValue(data)
+	value, err := readLib0VarString(&reader, op+".table")
 	if err != nil {
 		return nil, err
 	}
@@ -168,11 +170,15 @@ func newStringDecoderV2(data []byte, op string) (*stringDecoderV2, error) {
 	if err != nil {
 		return nil, wrapError(op+".lengths", reader.Offset(), err)
 	}
-	return &stringDecoderV2{
+	decoder := &stringDecoderV2{
 		lengths: newUintOptRleDecoder(remaining, op+".lengths"),
-		units:   encodeUTF16Units(value),
+		table:   value,
 		op:      op,
-	}, nil
+	}
+	if !isASCIIString(value) {
+		decoder.units = encodeUTF16Units(value)
+	}
+	return decoder, nil
 }
 
 func (d *stringDecoderV2) read() (string, error) {
@@ -182,11 +188,16 @@ func (d *stringDecoderV2) read() (string, error) {
 	}
 
 	end := d.pos + int(length)
-	if end < d.pos || end > len(d.units) {
+	if end < d.pos || end > d.utf16Length() {
 		return "", wrapError(d.op+".slice", d.pos, varint.ErrUnexpectedEOF)
 	}
 
-	value := string(utf16.Decode(d.units[d.pos:end]))
+	var value string
+	if d.units == nil {
+		value = d.table[d.pos:end]
+	} else {
+		value = string(utf16.Decode(d.units[d.pos:end]))
+	}
 	d.pos = end
 	return value, nil
 }
@@ -195,10 +206,26 @@ func (d *stringDecoderV2) ensureDrained() error {
 	if d == nil {
 		return nil
 	}
-	if d.pos != len(d.units) {
+	if d.pos != d.utf16Length() {
 		return wrapError(d.op+".trailing", d.pos, ErrTrailingBytes)
 	}
 	return d.lengths.ensureDrained()
+}
+
+func (d *stringDecoderV2) utf16Length() int {
+	if d.units == nil {
+		return len(d.table)
+	}
+	return len(d.units)
+}
+
+func isASCIIString(value string) bool {
+	for idx := 0; idx < len(value); idx++ {
+		if value[idx] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
 }
 
 func encodeUTF16Units(value string) []uint16 {

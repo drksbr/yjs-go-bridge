@@ -589,7 +589,7 @@ func (f *remoteOwnerForwarder) takeoverLocalOwner(
 		cancelSession()
 	}
 
-	if err := f.local.bootstrapConnection(r, req, connection, peer); err != nil {
+	if err := f.local.bootstrapConnection(r, req, connection, peer, true); err != nil {
 		f.local.cleanupConnectionWithOwnership(r, req, connection, ownership)
 		return err
 	}

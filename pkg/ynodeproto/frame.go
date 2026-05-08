@@ -154,6 +154,17 @@ func EncodeFrame(frame *Frame) ([]byte, error) {
 // DecodeFramePrefix decodifica o primeiro frame completo em src.
 // O retorno consumed informa quantos bytes pertencem ao frame lido.
 func DecodeFramePrefix(src []byte) (*Frame, int, error) {
+	return decodeFramePrefix(src, true)
+}
+
+// DecodeFramePrefixView decodifica o primeiro frame completo sem copiar o
+// payload. O frame retornado referencia src; use apenas quando o caller controla
+// a vida útil e imutabilidade do buffer.
+func DecodeFramePrefixView(src []byte) (*Frame, int, error) {
+	return decodeFramePrefix(src, false)
+}
+
+func decodeFramePrefix(src []byte, copyPayload bool) (*Frame, int, error) {
 	header, err := DecodeHeader(src)
 	if err != nil {
 		return nil, 0, err
@@ -172,9 +183,13 @@ func DecodeFramePrefix(src []byte) (*Frame, int, error) {
 		)
 	}
 
+	payload := src[HeaderSize:totalSize]
+	if copyPayload {
+		payload = append([]byte(nil), payload...)
+	}
 	frame := &Frame{
 		Header:  header,
-		Payload: append([]byte(nil), src[HeaderSize:totalSize]...),
+		Payload: payload,
 	}
 	if err := frame.Validate(); err != nil {
 		return nil, 0, err
@@ -190,6 +205,23 @@ func DecodeFrame(src []byte) (*Frame, error) {
 	}
 	if consumed != len(src) {
 		return nil, fmt.Errorf("%w: consumiu=%d total=%d", ErrTrailingBytes, consumed, len(src))
+	}
+	return frame, nil
+}
+
+// DecodeFrameView decodifica exatamente um frame sem copiar o payload.
+func DecodeFrameView(src []byte) (*Frame, error) {
+	frame, consumed, err := DecodeFramePrefixView(src)
+	if err != nil {
+		return nil, err
+	}
+	if consumed != len(src) {
+		return nil, fmt.Errorf(
+			"%w: consumido=%d total=%d",
+			ErrTrailingBytes,
+			consumed,
+			len(src),
+		)
 	}
 	return frame, nil
 }

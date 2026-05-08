@@ -32,6 +32,7 @@ type Server struct {
 	persistTimeout                time.Duration
 	fanoutConcurrency             int
 	bootstrapOnConnect            bool
+	bootstrapSyncOnConnect        bool
 	authorityRevalidationInterval time.Duration
 	authenticator                 Authenticator
 	authorizer                    Authorizer
@@ -60,6 +61,7 @@ type remoteOwnerCloseSignal struct {
 type serverSocketSessionOptions struct {
 	observeConnectionLifecycle bool
 	bootstrap                  bool
+	bootstrapSync              bool
 	authorityLossHandler       AuthorityLossHandler
 	ownership                  *ycluster.DocumentOwnershipHandle
 	quota                      QuotaLease
@@ -135,6 +137,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		persistTimeout:                persistTimeout,
 		fanoutConcurrency:             fanoutConcurrency,
 		bootstrapOnConnect:            cfg.BootstrapOnConnect,
+		bootstrapSyncOnConnect:        cfg.BootstrapSyncOnConnect,
 		authorityRevalidationInterval: cfg.AuthorityRevalidationInterval,
 		authenticator:                 cfg.Authenticator,
 		authorizer:                    cfg.Authorizer,
@@ -182,6 +185,7 @@ func (s *Server) serveResolvedHTTP(w http.ResponseWriter, r *http.Request, req R
 	s.serveResolvedHTTPWithOptions(w, r, req, serverSocketSessionOptions{
 		observeConnectionLifecycle: true,
 		bootstrap:                  s.bootstrapOnConnect,
+		bootstrapSync:              s.bootstrapSyncOnConnect,
 	})
 }
 
@@ -442,7 +446,7 @@ func (s *Server) serveConnectedSocket(
 	defer drainRemoteOwnerCloseSignal(revalidateCh)
 
 	if options.bootstrap {
-		if err := s.bootstrapConnection(r, req, connection, peer); err != nil {
+		if err := s.bootstrapConnection(r, req, connection, peer, options.bootstrapSync); err != nil {
 			if isAuthorityLostRetryableError(err) {
 				s.cleanupConnectionWithOwnership(r, req, connection, options.ownership)
 				s.handleAuthorityLoss(r, req, socket, connection.AuthorityEpoch(), options.authorityLossHandler)
@@ -577,7 +581,7 @@ func (s *Server) serveSwitchableConnectedSocket(
 	}
 
 	if options.bootstrap {
-		if err := s.bootstrapConnection(r, req, connection, peer); err != nil {
+		if err := s.bootstrapConnection(r, req, connection, peer, options.bootstrapSync); err != nil {
 			if isAuthorityLostRetryableError(err) {
 				s.cleanupConnectionWithOwnership(r, req, connection, options.ownership)
 				s.handleAuthorityLoss(r, req, socket, connection.AuthorityEpoch(), options.authorityLossHandler)
@@ -656,26 +660,30 @@ func (s *Server) serveSwitchableConnectedSocket(
 	}
 }
 
-func (s *Server) bootstrapConnection(r *http.Request, req Request, connection *yprotocol.Connection, peer roomPeer) error {
-	for _, payload := range [][]byte{
-		yprotocol.EncodeProtocolSyncStep1([]byte{0x00}),
-		yprotocol.EncodeProtocolQueryAwareness(),
-	} {
-		handleStart := time.Now()
-		result, err := connection.HandleEncodedMessagesContext(r.Context(), payload)
-		s.metrics.Handle(req, time.Since(handleStart), err)
-		if err != nil {
+func (s *Server) bootstrapConnection(r *http.Request, req Request, connection *yprotocol.Connection, peer roomPeer, includeSync bool) error {
+	if includeSync {
+		if err := s.bootstrapConnectionPayload(r, req, connection, peer, yprotocol.EncodeProtocolSyncStep1([]byte{0x00})); err != nil {
 			return err
 		}
-		if len(result.Direct) > 0 {
-			if err := s.writeBinary(peer, result.Direct); err != nil {
-				return err
-			}
-			s.metrics.FrameWritten(req, "direct", len(result.Direct))
+	}
+	return s.bootstrapConnectionPayload(r, req, connection, peer, yprotocol.EncodeProtocolQueryAwareness())
+}
+
+func (s *Server) bootstrapConnectionPayload(r *http.Request, req Request, connection *yprotocol.Connection, peer roomPeer, payload []byte) error {
+	handleStart := time.Now()
+	result, err := connection.HandleEncodedMessagesContext(r.Context(), payload)
+	s.metrics.Handle(req, time.Since(handleStart), err)
+	if err != nil {
+		return err
+	}
+	if len(result.Direct) > 0 {
+		if err := s.writeBinary(peer, result.Direct); err != nil {
+			return err
 		}
-		if len(result.Broadcast) > 0 {
-			s.fanout(r, req, result.Broadcast)
-		}
+		s.metrics.FrameWritten(req, "direct", len(result.Direct))
+	}
+	if len(result.Broadcast) > 0 {
+		s.fanout(r, req, result.Broadcast)
 	}
 	return nil
 }
@@ -1033,18 +1041,17 @@ func (s *Server) startAuthorityRevalidator(
 	}
 	connectionID := connection.ID()
 	s.authorityRevalidations.add(req.DocumentKey, connectionID, session)
+	if s.authorityRevalidationInterval <= 0 {
+		context.AfterFunc(ctx, func() {
+			s.authorityRevalidations.remove(req.DocumentKey, connectionID)
+		})
+		return signals
+	}
 
 	go func() {
-		var ticker *time.Ticker
-		var tick <-chan time.Time
-		if s.authorityRevalidationInterval > 0 {
-			ticker = time.NewTicker(s.authorityRevalidationInterval)
-			tick = ticker.C
-		}
+		ticker := time.NewTicker(s.authorityRevalidationInterval)
 		defer func() {
-			if ticker != nil {
-				ticker.Stop()
-			}
+			ticker.Stop()
 			s.authorityRevalidations.remove(req.DocumentKey, connectionID)
 		}()
 
@@ -1052,7 +1059,7 @@ func (s *Server) startAuthorityRevalidator(
 			select {
 			case <-ctx.Done():
 				return
-			case <-tick:
+			case <-ticker.C:
 				checkCtx, cancel := context.WithTimeout(context.Background(), s.writeTimeout)
 				err := s.revalidateAuthoritySession(checkCtx, session)
 				cancel()

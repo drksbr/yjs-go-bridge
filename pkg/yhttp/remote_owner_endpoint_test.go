@@ -671,6 +671,9 @@ func TestRemoteOwnerEndpointNegotiatedV2SendsRemoteUpdatesV2(t *testing.T) {
 	if handshakeAck.Flags&ynodeproto.FlagSupportsUpdateV2 == 0 {
 		t.Fatalf("handshakeAck.Flags = %#x, want V2 support", handshakeAck.Flags)
 	}
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(local.registry.peersExcept(key, "local")) > 0
+	})
 
 	localUpdate := buildGCOnlyUpdate(912, 2)
 	writeBinary(t, localPeer, yprotocol.EncodeProtocolSyncUpdate(localUpdate))
