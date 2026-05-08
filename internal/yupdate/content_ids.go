@@ -6,6 +6,7 @@ import (
 
 	"github.com/drksbr/yjs-crdt-golang-server/internal/varint"
 	"github.com/drksbr/yjs-crdt-golang-server/internal/yidset"
+	"github.com/drksbr/yjs-crdt-golang-server/internal/ytypes"
 )
 
 // ContentIDs representa os ranges de inserts e deletes presentes em um update.
@@ -44,6 +45,16 @@ func (c *ContentIDs) IsEmpty() bool {
 // CreateContentIDsFromUpdateV1 reproduz a extração de content ids do Yjs para updates V1.
 func CreateContentIDsFromUpdateV1(update []byte) (*ContentIDs, error) {
 	return ReadUpdateToContentIDsV1(update)
+}
+
+// CreateContentIDsFromUpdateV2 extrai content ids de um único update V2 sem
+// materializar um payload V1 intermediário.
+func CreateContentIDsFromUpdateV2(update []byte) (*ContentIDs, error) {
+	decoded, err := DecodeV2(update)
+	if err != nil {
+		return nil, err
+	}
+	return contentIDsFromDecodedUpdate(decoded)
 }
 
 // ReadUpdateToContentIDsV1 segue a semântica atual do Yjs para content ids.
@@ -100,12 +111,81 @@ func ReadUpdateToContentIDsV1(update []byte) (*ContentIDs, error) {
 		return nil, err
 	}
 	if deleteSet != nil {
-		for _, client := range deleteSet.Clients() {
-			for _, r := range deleteSet.Ranges(client) {
+		var addErr error
+		deleteSet.ForEachClient(func(client uint32, ranges []ytypes.DeleteRange) {
+			if addErr != nil {
+				return
+			}
+			for _, r := range ranges {
 				if err := contentIDs.Deletes.Add(client, r.Clock, r.Length); err != nil {
-					return nil, err
+					addErr = err
+					return
 				}
 			}
+		})
+		if addErr != nil {
+			return nil, addErr
+		}
+	}
+	return contentIDs, nil
+}
+
+func contentIDsFromDecodedUpdate(decoded *DecodedUpdate) (*ContentIDs, error) {
+	contentIDs := NewContentIDs()
+	if decoded == nil {
+		return contentIDs, nil
+	}
+	var (
+		hasPending bool
+		lastClient uint32
+		lastClock  uint32
+		lastLen    uint32
+	)
+	flushInsert := func() error {
+		if !hasPending {
+			return nil
+		}
+		if err := contentIDs.Inserts.Add(lastClient, lastClock, lastLen); err != nil {
+			return err
+		}
+		hasPending = false
+		return nil
+	}
+	for _, current := range decoded.Structs {
+		if current == nil || isSkip(current) {
+			continue
+		}
+		id := current.ID()
+		if hasPending && lastClient == id.Client && uint64(lastClock)+uint64(lastLen) == uint64(id.Clock) {
+			lastLen += current.Length()
+			continue
+		}
+		if err := flushInsert(); err != nil {
+			return nil, err
+		}
+		hasPending = true
+		lastClient = id.Client
+		lastClock = id.Clock
+		lastLen = current.Length()
+	}
+	if err := flushInsert(); err != nil {
+		return nil, err
+	}
+	if decoded.DeleteSet != nil {
+		var addErr error
+		decoded.DeleteSet.ForEachClient(func(client uint32, ranges []ytypes.DeleteRange) {
+			if addErr != nil {
+				return
+			}
+			for _, r := range ranges {
+				if err := contentIDs.Deletes.Add(client, r.Clock, r.Length); err != nil {
+					addErr = err
+					return
+				}
+			}
+		})
+		if addErr != nil {
+			return nil, addErr
 		}
 	}
 	return contentIDs, nil
@@ -120,11 +200,11 @@ func MergeContentIDs(a *ContentIDs, b ...*ContentIDs) *ContentIDs {
 		if source == nil {
 			return
 		}
-		for _, client := range source.Clients() {
-			for _, r := range source.Ranges(client) {
+		source.ForEachClient(func(client uint32, ranges []yidset.Range) {
+			for _, r := range ranges {
 				_ = target.Add(client, r.Clock, r.Length)
 			}
-		}
+		})
 	}
 
 	if a != nil {
@@ -158,18 +238,16 @@ func EncodeContentIDs(contentIDs *ContentIDs) ([]byte, error) {
 }
 
 func appendIDSetToWire(dst []byte, set *yidset.IdSet) []byte {
-	clients := set.Clients()
-	dst = varint.Append(dst, uint32(len(clients)))
+	dst = varint.Append(dst, uint32(set.ClientCount()))
 
-	for _, client := range clients {
-		ranges := set.Ranges(client)
+	set.ForEachClient(func(client uint32, ranges []yidset.Range) {
 		dst = varint.Append(dst, client)
 		dst = varint.Append(dst, uint32(len(ranges)))
 		for _, r := range ranges {
 			dst = varint.Append(dst, r.Clock)
 			dst = varint.Append(dst, r.Length)
 		}
-	}
+	})
 	return dst
 }
 
@@ -265,11 +343,7 @@ func ContentIDsFromUpdatesContext(ctx context.Context, updates ...[]byte) (*Cont
 	case UpdateFormatUnknown:
 		return NewContentIDs(), nil
 	case UpdateFormatV2:
-		converted, err := ConvertUpdatesToV1Context(ctx, updates...)
-		if err != nil {
-			return nil, err
-		}
-		return extractContentIDsFromUpdateV1(ctx, 0, converted)
+		return aggregatePayloadsInParallel(ctx, updates, 0, extractContentIDsFromUpdateV2, mergeContentIDPayloads)
 	}
 
 	return aggregatePayloadsInParallel(ctx, updates, 0, extractContentIDsFromUpdateV1, mergeContentIDPayloads)
@@ -292,6 +366,13 @@ func extractContentIDsFromUpdateV1(_ context.Context, _ int, update []byte) (*Co
 		return NewContentIDs(), nil
 	}
 	return CreateContentIDsFromUpdateV1(update)
+}
+
+func extractContentIDsFromUpdateV2(_ context.Context, _ int, update []byte) (*ContentIDs, error) {
+	if len(update) == 0 {
+		return NewContentIDs(), nil
+	}
+	return CreateContentIDsFromUpdateV2(update)
 }
 
 func mergeContentIDPayloads(_ context.Context, contents []*ContentIDs) (*ContentIDs, error) {

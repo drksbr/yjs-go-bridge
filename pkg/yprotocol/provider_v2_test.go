@@ -49,11 +49,8 @@ func TestConnectionHandleEncodedMessagesV2DirectOutputOptIn(t *testing.T) {
 		t.Fatalf("direct sync type = %v, want %v", messages[0].Sync.Type, SyncMessageTypeStep2)
 	}
 	assertProtocolV2PayloadEquivalentToV1(t, messages[0].Sync.Payload, update)
-	if !bytes.Equal(conn.session.UpdateV1(), update) {
-		t.Fatalf("session.UpdateV1() changed after v2 direct egress")
-	}
-	assertProtocolV2PayloadEquivalentToV1(t, conn.session.UpdateV2(), update)
 	assertProtocolV2PayloadEquivalentToV1(t, conn.room.updateV2, update)
+	assertConnectionSyncStep2EquivalentToV1(t, conn, update)
 }
 
 func TestConnectionV2DirectOutputUsesYjsWireFormatForTextFormatting(t *testing.T) {
@@ -142,8 +139,8 @@ func TestConnectionHandleEncodedMessagesV2BroadcastOutputOptInKeepsStorageV1(t *
 		t.Fatalf("broadcast sync payload = %x, want canonical V2 %x", messages[0].Sync.Payload, wantBroadcastV2)
 	}
 	assertProtocolV2PayloadEquivalentToV1(t, messages[0].Sync.Payload, v1Update)
-	assertProtocolV2PayloadEquivalentToV1(t, conn.session.UpdateV2(), v1Update)
 	assertProtocolV2PayloadEquivalentToV1(t, conn.room.updateV2, v1Update)
+	assertConnectionSyncStep2EquivalentToV1(t, conn, v1Update)
 
 	records, err := store.ListUpdates(ctx, key, 0, 0)
 	if err != nil {
@@ -226,10 +223,7 @@ func TestProviderOpenHydratesRoomV2FromPersistedSnapshot(t *testing.T) {
 	}
 
 	assertProtocolV2PayloadEquivalentToV1(t, conn.room.updateV2, update)
-	assertProtocolV2PayloadEquivalentToV1(t, conn.session.UpdateV2(), update)
-	if !bytes.Equal(conn.session.UpdateV1(), update) {
-		t.Fatalf("conn.session.UpdateV1() = %x, want V1 compatibility %x", conn.session.UpdateV1(), update)
-	}
+	assertConnectionSyncStep2EquivalentToV1(t, conn, update)
 }
 
 func assertProtocolV2PayloadEquivalentToV1(t *testing.T, gotV2, wantV1 []byte) {
@@ -248,5 +242,28 @@ func assertProtocolV2PayloadEquivalentToV1(t *testing.T, gotV2, wantV1 []byte) {
 	}
 	if !bytes.Equal(gotV1, wantV1) {
 		t.Fatalf("ConvertUpdateToV1(gotV2) = %x, want %x", gotV1, wantV1)
+	}
+}
+
+func assertConnectionSyncStep2EquivalentToV1(t *testing.T, conn *Connection, wantV1 []byte) {
+	t.Helper()
+
+	result, err := conn.HandleEncodedMessages(EncodeProtocolSyncStep1([]byte{0x00}))
+	if err != nil {
+		t.Fatalf("HandleEncodedMessages(step1) unexpected error: %v", err)
+	}
+	messages, err := DecodeProtocolMessages(result.Direct)
+	if err != nil {
+		t.Fatalf("DecodeProtocolMessages(step1 direct) unexpected error: %v", err)
+	}
+	if len(messages) != 1 || messages[0].Sync == nil || messages[0].Sync.Type != SyncMessageTypeStep2 {
+		t.Fatalf("step1 direct messages = %#v, want single sync step2", messages)
+	}
+	expected, err := yjsbridge.DiffUpdate(wantV1, []byte{0x00})
+	if err != nil {
+		t.Fatalf("DiffUpdate() unexpected error: %v", err)
+	}
+	if !bytes.Equal(messages[0].Sync.Payload, expected) {
+		t.Fatalf("step2 payload = %x, want %x", messages[0].Sync.Payload, expected)
 	}
 }

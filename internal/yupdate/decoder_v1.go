@@ -2,7 +2,6 @@ package yupdate
 
 import (
 	"fmt"
-	"unicode/utf16"
 
 	ybinary "github.com/drksbr/yjs-crdt-golang-server/internal/binary"
 	"github.com/drksbr/yjs-crdt-golang-server/internal/varint"
@@ -72,9 +71,7 @@ func (d *decoderV1) readBuf(op string) ([]byte, error) {
 	if err != nil {
 		return nil, wrapError(op, d.offset(), err)
 	}
-	copied := make([]byte, len(buf))
-	copy(copied, buf)
-	return copied, nil
+	return buf, nil
 }
 
 func (d *decoderV1) readParentInfo() (bool, error) {
@@ -93,5 +90,13 @@ func (d *decoderV1) readParentInfo() (bool, error) {
 }
 
 func utf16Length(s string) uint32 {
-	return uint32(len(utf16.Encode([]rune(s))))
+	var length uint32
+	for _, r := range s {
+		if r <= 0xffff {
+			length++
+			continue
+		}
+		length += 2
+	}
+	return length
 }

@@ -10,9 +10,17 @@ func garbageCollectDeletedContent(decoded *DecodedUpdate) (*DecodedUpdate, error
 	}
 
 	referenced := referencedItemClocks(decoded.Structs)
+	deleteRanges := make(map[uint32][]ytypes.DeleteRange, decoded.DeleteSet.ClientCount())
+	decoded.DeleteSet.ForEachClient(func(client uint32, ranges []ytypes.DeleteRange) {
+		deleteRanges[client] = ranges
+	})
 	structs := make([]ytypes.Struct, 0, len(decoded.Structs))
 	for _, current := range decoded.Structs {
-		next, err := garbageCollectStruct(current, decoded.DeleteSet, referenced)
+		var ranges []ytypes.DeleteRange
+		if current != nil {
+			ranges = deleteRanges[current.ID().Client]
+		}
+		next, err := garbageCollectStruct(current, ranges, referenced)
 		if err != nil {
 			return nil, err
 		}
@@ -25,17 +33,13 @@ func garbageCollectDeletedContent(decoded *DecodedUpdate) (*DecodedUpdate, error
 	}, nil
 }
 
-func garbageCollectStruct(current ytypes.Struct, ds *ytypes.DeleteSet, referenced map[uint32][]uint32) ([]ytypes.Struct, error) {
-	if current == nil || ds == nil || ds.IsEmpty() {
+func garbageCollectStruct(current ytypes.Struct, ranges []ytypes.DeleteRange, referenced map[uint32][]uint32) ([]ytypes.Struct, error) {
+	if current == nil || len(ranges) == 0 {
 		return []ytypes.Struct{current}, nil
 	}
 
 	start := current.ID().Clock
 	end := current.EndClock()
-	ranges := ds.Ranges(current.ID().Client)
-	if len(ranges) == 0 {
-		return []ytypes.Struct{current}, nil
-	}
 
 	result := make([]ytypes.Struct, 0, 3)
 	cursor := start

@@ -36,7 +36,7 @@ func StateVectorFromUpdatesContext(ctx context.Context, updates ...[]byte) (map[
 		if err != nil {
 			return nil, err
 		}
-		return stateVectorFromStructs(merged.blockSet.structs()), nil
+		return stateVectorFromBlockSet(merged.blockSet), nil
 	}
 
 	stateVectors, err := aggregatePayloadsInParallel(ctx, updates, 0, extractStateVectorFromUpdateV1, mergeStateVectors)
@@ -56,6 +56,25 @@ func stateVectorFromStructs(structs []ytypes.Struct) map[uint32]uint32 {
 		endClock := current.EndClock()
 		if endClock > stateVector[client] {
 			stateVector[client] = endClock
+		}
+	}
+	return stateVector
+}
+
+func stateVectorFromBlockSet(blockSet *blockSetV1) map[uint32]uint32 {
+	if blockSet == nil || len(blockSet.clients) == 0 {
+		return map[uint32]uint32{}
+	}
+	stateVector := make(map[uint32]uint32, len(blockSet.clients))
+	for client, structs := range blockSet.clients {
+		for _, current := range structs {
+			if current == nil {
+				continue
+			}
+			endClock := current.EndClock()
+			if endClock > stateVector[client] {
+				stateVector[client] = endClock
+			}
 		}
 	}
 	return stateVector
@@ -87,12 +106,7 @@ func extractStateVectorFromUpdateV1(_ context.Context, _ int, update []byte) (ma
 	if len(update) == 0 {
 		return map[uint32]uint32{}, nil
 	}
-
-	stateVectorPayload, err := EncodeStateVectorFromUpdateV1(update)
-	if err != nil {
-		return nil, err
-	}
-	return DecodeStateVectorV1(stateVectorPayload)
+	return stateVectorFromUpdateV1(update)
 }
 
 func mergeStateVectors(_ context.Context, vectors []map[uint32]uint32) (map[uint32]uint32, error) {
@@ -100,7 +114,11 @@ func mergeStateVectors(_ context.Context, vectors []map[uint32]uint32) (map[uint
 		return map[uint32]uint32{}, nil
 	}
 
-	merged := make(map[uint32]uint32, len(vectors))
+	capacity := 0
+	for _, vector := range vectors {
+		capacity += len(vector)
+	}
+	merged := make(map[uint32]uint32, capacity)
 	for _, vector := range vectors {
 		if len(vector) == 0 {
 			continue

@@ -37,6 +37,7 @@ func (s *Store) AppendUpdate(ctx context.Context, key storage.DocumentKey, updat
 	if len(update) == 0 {
 		return nil, fmt.Errorf("%w: updateV1 obrigatorio", storage.ErrInvalidUpdatePayload)
 	}
+	updateV2, _ := yjsbridge.ConvertUpdateToV2(update)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -44,7 +45,7 @@ func (s *Store) AppendUpdate(ctx context.Context, key storage.DocumentKey, updat
 	s.ensureStoreInitializedLocked()
 
 	offset := s.updateNext[key] + 1
-	record := newUpdateLogRecord(key, offset, update, nil, 0, s.nowTime())
+	record := newUpdateLogRecord(key, offset, update, updateV2, 0, s.nowTime())
 	s.updateLogs[key] = append(s.updateLogs[key], record)
 	s.updateNext[key] = offset
 	return record.Clone(), nil
@@ -83,6 +84,7 @@ func (s *Store) AppendUpdateAuthoritative(
 	if err := fence.Validate(); err != nil {
 		return nil, err
 	}
+	updateV2, _ := yjsbridge.ConvertUpdateToV2(update)
 
 	now := s.nowTime()
 
@@ -95,7 +97,7 @@ func (s *Store) AppendUpdateAuthoritative(
 	}
 
 	offset := s.updateNext[key] + 1
-	record := newUpdateLogRecord(key, offset, update, nil, fence.Owner.Epoch, now)
+	record := newUpdateLogRecord(key, offset, update, updateV2, fence.Owner.Epoch, now)
 	s.updateLogs[key] = append(s.updateLogs[key], record)
 	s.updateNext[key] = offset
 	return record.Clone(), nil
@@ -170,8 +172,6 @@ func newUpdateLogRecord(key storage.DocumentKey, offset storage.UpdateOffset, up
 	}
 	if len(updateV2) > 0 {
 		record.UpdateV2 = append([]byte(nil), updateV2...)
-	} else if converted, err := yjsbridge.ConvertUpdateToV2(updateV1); err == nil {
-		record.UpdateV2 = converted
 	}
 	return record
 }
@@ -189,26 +189,29 @@ func (s *Store) ListUpdates(ctx context.Context, key storage.DocumentKey, after 
 	}
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	records := s.updateLogs[key]
 	if len(records) == 0 {
+		s.mu.RUnlock()
 		return nil, nil
 	}
 
-	maxResults := len(records)
+	start := firstUpdateLogIndexAfter(records, after)
+	if start >= len(records) {
+		s.mu.RUnlock()
+		return nil, nil
+	}
+
+	maxResults := len(records) - start
 	if limit > 0 && limit < maxResults {
 		maxResults = limit
 	}
-	result := make([]*storage.UpdateLogRecord, 0, maxResults)
-	for _, record := range records {
-		if record.Offset <= after {
-			continue
-		}
-		result = append(result, record.Clone())
-		if limit > 0 && len(result) >= limit {
-			break
-		}
+	selected := make([]*storage.UpdateLogRecord, maxResults)
+	copy(selected, records[start:start+maxResults])
+	s.mu.RUnlock()
+
+	result := make([]*storage.UpdateLogRecord, len(selected))
+	for idx, record := range selected {
+		result[idx] = record.Clone()
 	}
 	return result, nil
 }
@@ -235,23 +238,17 @@ func (s *Store) TrimUpdates(ctx context.Context, key storage.DocumentKey, throug
 		return nil
 	}
 
-	firstRemaining := 0
-	for firstRemaining < len(records) && records[firstRemaining].Offset <= through {
-		firstRemaining++
-	}
-
-	switch {
-	case firstRemaining == 0:
+	firstRemaining := firstUpdateLogIndexAfter(records, through)
+	if firstRemaining == 0 {
 		return nil
-	case firstRemaining >= len(records):
+	}
+	if firstRemaining >= len(records) {
 		delete(s.updateLogs, key)
 		return nil
-	default:
-		trimmed := make([]*storage.UpdateLogRecord, len(records)-firstRemaining)
-		copy(trimmed, records[firstRemaining:])
-		s.updateLogs[key] = trimmed
-		return nil
 	}
+
+	s.updateLogs[key] = trimUpdateLogRecordPointers(records, firstRemaining)
+	return nil
 }
 
 // TrimUpdatesAuthoritative remove registros com offset menor ou igual ao
@@ -290,23 +287,45 @@ func (s *Store) TrimUpdatesAuthoritative(
 		return nil
 	}
 
-	firstRemaining := 0
-	for firstRemaining < len(records) && records[firstRemaining].Offset <= through {
-		firstRemaining++
-	}
-
-	switch {
-	case firstRemaining == 0:
+	firstRemaining := firstUpdateLogIndexAfter(records, through)
+	if firstRemaining == 0 {
 		return nil
-	case firstRemaining >= len(records):
+	}
+	if firstRemaining >= len(records) {
 		delete(s.updateLogs, key)
 		return nil
-	default:
-		trimmed := make([]*storage.UpdateLogRecord, len(records)-firstRemaining)
-		copy(trimmed, records[firstRemaining:])
-		s.updateLogs[key] = trimmed
+	}
+
+	s.updateLogs[key] = trimUpdateLogRecordPointers(records, firstRemaining)
+	return nil
+}
+
+func firstUpdateLogIndexAfter(records []*storage.UpdateLogRecord, after storage.UpdateOffset) int {
+	return sort.Search(len(records), func(i int) bool {
+		return records[i] != nil && records[i].Offset > after
+	})
+}
+
+func cloneUpdateLogRecordPointers(records []*storage.UpdateLogRecord) []*storage.UpdateLogRecord {
+	cloned := make([]*storage.UpdateLogRecord, len(records))
+	copy(cloned, records)
+	return cloned
+}
+
+func trimUpdateLogRecordPointers(records []*storage.UpdateLogRecord, firstRemaining int) []*storage.UpdateLogRecord {
+	if firstRemaining <= 0 {
+		return records
+	}
+	if firstRemaining >= len(records) {
 		return nil
 	}
+	if firstRemaining <= len(records)/4 {
+		for idx := 0; idx < firstRemaining; idx++ {
+			records[idx] = nil
+		}
+		return records[firstRemaining:]
+	}
+	return cloneUpdateLogRecordPointers(records[firstRemaining:])
 }
 
 // SavePlacement grava ou substitui o placement lógico do documento.

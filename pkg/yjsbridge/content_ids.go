@@ -170,15 +170,15 @@ func collectRanges(set *yidset.IdSet) []IDRange {
 		return []IDRange{}
 	}
 
-	out := make([]IDRange, 0)
-	for _, client := range set.Clients() {
-		for _, current := range set.Ranges(client) {
+	out := make([]IDRange, 0, set.TotalRangeCount())
+	set.ForEachClient(func(client uint32, ranges []yidset.Range) {
+		for _, current := range ranges {
 			out = append(out, IDRange{
 				Client: client,
 				Clock:  current.Clock,
 				Length: current.Length,
 			})
 		}
-	}
+	})
 	return out
 }

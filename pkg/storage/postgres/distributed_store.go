@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/storage"
+	"github.com/drksbr/yjs-crdt-golang-server/pkg/yjsbridge"
 )
 
 var _ storage.DistributedStore = (*Store)(nil)
@@ -33,6 +34,7 @@ func (s *Store) AppendUpdate(ctx context.Context, key storage.DocumentKey, updat
 	if err != nil {
 		return nil, err
 	}
+	updateV2, _ := yjsbridge.ConvertUpdateToV2(update)
 
 	query := fmt.Sprintf(`
 WITH allocated AS (
@@ -51,7 +53,7 @@ RETURNING log_offset, owner_epoch, stored_at
 	var offset int64
 	var epoch int64
 	var storedAt time.Time
-	if err := pool.QueryRow(ctx, query, key.Namespace, key.DocumentID, update, nil).Scan(&offset, &epoch, &storedAt); err != nil {
+	if err := pool.QueryRow(ctx, query, key.Namespace, key.DocumentID, update, nullableBytes(updateV2)).Scan(&offset, &epoch, &storedAt); err != nil {
 		return nil, err
 	}
 
@@ -68,6 +70,7 @@ RETURNING log_offset, owner_epoch, stored_at
 		Key:      key,
 		Offset:   logOffset,
 		UpdateV1: append([]byte(nil), update...),
+		UpdateV2: append([]byte(nil), updateV2...),
 		Epoch:    epochValue,
 		StoredAt: storedAt,
 	}, nil
@@ -110,7 +113,7 @@ func (s *Store) AppendUpdateAuthoritative(
 		_ = tx.Rollback(context.Background())
 	}()
 
-	if err := s.validateAuthorityTx(ctx, tx, key, fence, time.Now().UTC()); err != nil {
+	if err := s.validateAuthorityWriteTx(ctx, tx, key, fence, time.Now().UTC()); err != nil {
 		return nil, err
 	}
 
@@ -188,7 +191,7 @@ func (s *Store) appendUpdateV2(
 	defer func() {
 		_ = tx.Rollback(context.Background())
 	}()
-	if err := s.validateAuthorityTx(ctx, tx, key, *fence, time.Now().UTC()); err != nil {
+	if err := s.validateAuthorityWriteTx(ctx, tx, key, *fence, time.Now().UTC()); err != nil {
 		return nil, err
 	}
 	logOffset, storedAt, err := s.appendUpdateTx(ctx, tx, key, updateV1, updateV2, epoch)
@@ -245,6 +248,9 @@ ORDER BY log_offset ASC
 	defer rows.Close()
 
 	var records []*storage.UpdateLogRecord
+	if limit > 0 {
+		records = make([]*storage.UpdateLogRecord, 0, limit)
+	}
 	for rows.Next() {
 		var offset int64
 		var payloadV1 []byte
@@ -334,7 +340,7 @@ func (s *Store) TrimUpdatesAuthoritative(
 		_ = tx.Rollback(context.Background())
 	}()
 
-	if err := s.validateAuthorityTx(ctx, tx, key, fence, time.Now().UTC()); err != nil {
+	if err := s.validateAuthorityWriteTx(ctx, tx, key, fence, time.Now().UTC()); err != nil {
 		return err
 	}
 
@@ -1006,7 +1012,7 @@ WHERE namespace = $1 AND document_id = $2 AND log_offset <= $3
 	return err
 }
 
-func (s *Store) validateAuthorityTx(
+func (s *Store) validateAuthorityWriteTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	key storage.DocumentKey,
@@ -1038,10 +1044,7 @@ FOR UPDATE
 		)
 	}
 
-	if err := s.ensureLeaseGenerationLockTx(ctx, tx, fence.ShardID); err != nil {
-		return err
-	}
-	lease, _, err := s.loadLeaseStateTx(ctx, tx, fence.ShardID)
+	lease, err := s.loadLeaseForAuthorityWriteTx(ctx, tx, fence.ShardID)
 	if err != nil {
 		return err
 	}
@@ -1066,4 +1069,41 @@ FOR UPDATE
 		return fmt.Errorf("%w: lease expirada para shard %s", storage.ErrAuthorityLost, fence.ShardID)
 	}
 	return nil
+}
+
+func (s *Store) loadLeaseForAuthorityWriteTx(ctx context.Context, tx pgx.Tx, shardID storage.ShardID) (*storage.LeaseRecord, error) {
+	leaseQuery := fmt.Sprintf(`
+SELECT owner_node_id, owner_epoch, token, acquired_at, expires_at
+FROM %s.shard_leases
+WHERE shard_id = $1
+FOR UPDATE
+`, quoteIdentifier(s.schema))
+
+	var nodeID string
+	var epoch int64
+	var token string
+	var acquiredAt time.Time
+	var expiresAt time.Time
+	err := tx.QueryRow(ctx, leaseQuery, shardID).Scan(&nodeID, &epoch, &token, &acquiredAt, &expiresAt)
+	switch {
+	case isNoRows(err):
+		return nil, nil
+	case err != nil:
+		return nil, err
+	}
+
+	normalizedEpoch, err := int64ToUint64("owner epoch", epoch)
+	if err != nil {
+		return nil, err
+	}
+	return &storage.LeaseRecord{
+		ShardID: shardID,
+		Owner: storage.OwnerInfo{
+			NodeID: storage.NodeID(nodeID),
+			Epoch:  normalizedEpoch,
+		},
+		Token:      token,
+		AcquiredAt: acquiredAt,
+		ExpiresAt:  expiresAt,
+	}, nil
 }

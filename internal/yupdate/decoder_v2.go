@@ -34,39 +34,39 @@ func newDecoderV2(data []byte) (*decoderV2, error) {
 		return nil, unsupportedV2FeatureFlag(featureFlag)
 	}
 
-	keyClockData, err := readLib0VarUint8Array(reader, "ReadV2KeyClockEncoder")
+	keyClockData, err := readLib0VarUint8ArrayView(reader, "ReadV2KeyClockEncoder")
 	if err != nil {
 		return nil, err
 	}
-	clientData, err := readLib0VarUint8Array(reader, "ReadV2ClientEncoder")
+	clientData, err := readLib0VarUint8ArrayView(reader, "ReadV2ClientEncoder")
 	if err != nil {
 		return nil, err
 	}
-	leftClockData, err := readLib0VarUint8Array(reader, "ReadV2LeftClockEncoder")
+	leftClockData, err := readLib0VarUint8ArrayView(reader, "ReadV2LeftClockEncoder")
 	if err != nil {
 		return nil, err
 	}
-	rightClockData, err := readLib0VarUint8Array(reader, "ReadV2RightClockEncoder")
+	rightClockData, err := readLib0VarUint8ArrayView(reader, "ReadV2RightClockEncoder")
 	if err != nil {
 		return nil, err
 	}
-	infoData, err := readLib0VarUint8Array(reader, "ReadV2InfoEncoder")
+	infoData, err := readLib0VarUint8ArrayView(reader, "ReadV2InfoEncoder")
 	if err != nil {
 		return nil, err
 	}
-	stringData, err := readLib0VarUint8Array(reader, "ReadV2StringEncoder")
+	stringData, err := readLib0VarUint8ArrayView(reader, "ReadV2StringEncoder")
 	if err != nil {
 		return nil, err
 	}
-	parentInfoData, err := readLib0VarUint8Array(reader, "ReadV2ParentInfoEncoder")
+	parentInfoData, err := readLib0VarUint8ArrayView(reader, "ReadV2ParentInfoEncoder")
 	if err != nil {
 		return nil, err
 	}
-	typeRefData, err := readLib0VarUint8Array(reader, "ReadV2TypeRefEncoder")
+	typeRefData, err := readLib0VarUint8ArrayView(reader, "ReadV2TypeRefEncoder")
 	if err != nil {
 		return nil, err
 	}
-	lengthData, err := readLib0VarUint8Array(reader, "ReadV2LenEncoder")
+	lengthData, err := readLib0VarUint8ArrayView(reader, "ReadV2LenEncoder")
 	if err != nil {
 		return nil, err
 	}
@@ -106,20 +106,29 @@ func (d *decoderV2) ensureDrained() error {
 	if err := d.keyClock.ensureDrained(); err != nil {
 		return err
 	}
-	checks := []func() error{
-		d.client.ensureDrained,
-		d.leftClock.ensureDrained,
-		d.rightClock.ensureDrained,
-		d.info.ensureDrained,
-		d.strings.ensureDrained,
-		d.parentInfo.ensureDrained,
-		d.typeRef.ensureDrained,
-		d.lengths.ensureDrained,
+	if err := d.client.ensureDrained(); err != nil {
+		return err
 	}
-	for _, check := range checks {
-		if err := check(); err != nil {
-			return err
-		}
+	if err := d.leftClock.ensureDrained(); err != nil {
+		return err
+	}
+	if err := d.rightClock.ensureDrained(); err != nil {
+		return err
+	}
+	if err := d.info.ensureDrained(); err != nil {
+		return err
+	}
+	if err := d.strings.ensureDrained(); err != nil {
+		return err
+	}
+	if err := d.parentInfo.ensureDrained(); err != nil {
+		return err
+	}
+	if err := d.typeRef.ensureDrained(); err != nil {
+		return err
+	}
+	if err := d.lengths.ensureDrained(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -205,7 +214,7 @@ func (d *decoderV2) readKey() (string, error) {
 }
 
 func (d *decoderV2) readBuf(op string) ([]byte, error) {
-	return readLib0VarUint8Array(d.rest, op)
+	return readLib0VarUint8ArrayView(d.rest, op)
 }
 
 func (d *decoderV2) readVarString(op string) (string, error) {

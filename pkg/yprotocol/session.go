@@ -1,6 +1,7 @@
 package yprotocol
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -173,7 +174,7 @@ func (s *Session) HandleProtocolMessagesWithOptions(opts SessionHandleOptions, m
 		return nil, ErrNilSession
 	}
 
-	out := make([]*ProtocolMessage, 0)
+	out := make([]*ProtocolMessage, 0, len(messages))
 	for idx, message := range messages {
 		responses, err := s.HandleProtocolMessageWithOptions(message, opts)
 		if err != nil {
@@ -243,23 +244,38 @@ func (s *Session) handleSyncMessage(message *SyncMessage, opts SessionHandleOpti
 }
 
 func (s *Session) diffForSyncStep1(stateVector []byte, opts SessionHandleOptions) ([]byte, error) {
-	return diffForSyncOutputFormat(s.UpdateV2(), stateVector, opts.SyncOutputFormat)
+	return diffForSyncOutputFormat(context.Background(), s.UpdateV2(), stateVector, opts.SyncOutputFormat)
 }
 
-func diffForSyncOutputFormat(updateV2, stateVector []byte, format yjsbridge.UpdateFormat) ([]byte, error) {
+func diffForSyncOutputFormat(ctx context.Context, updateV2, stateVector []byte, format yjsbridge.UpdateFormat) ([]byte, error) {
+	return diffForSyncOutputFormatFromUpdates(ctx, nil, updateV2, stateVector, format)
+}
+
+func diffForSyncOutputFormatFromUpdates(ctx context.Context, updateV1, updateV2, stateVector []byte, format yjsbridge.UpdateFormat) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	switch format {
 	case yjsbridge.UpdateFormatUnknown, yjsbridge.UpdateFormatV1:
-		updateV1, err := yjsbridge.ConvertUpdateToV1YjsWire(updateV2)
+		if len(updateV1) == 0 {
+			var err error
+			updateV1, err = yjsbridge.ConvertUpdateToV1YjsWire(updateV2)
+			if err != nil {
+				return nil, err
+			}
+			return yjsbridge.DiffUpdateContext(ctx, updateV1, stateVector)
+		}
+		diffV1, err := yjsbridge.DiffUpdateContext(ctx, updateV1, stateVector)
 		if err != nil {
 			return nil, err
 		}
-		return yjsbridge.DiffUpdate(updateV1, stateVector)
+		return yjsbridge.ConvertUpdateToV1YjsWire(diffV1)
 	case yjsbridge.UpdateFormatV2:
-		diff, err := yjsbridge.DiffUpdateV2(updateV2, stateVector)
+		diffV1, err := yjsbridge.DiffUpdateContext(ctx, updateV2, stateVector)
 		if err != nil {
 			return nil, err
 		}
-		return yjsbridge.ConvertUpdateToV2YjsWire(diff)
+		return yjsbridge.ConvertUpdateToV2YjsWire(diffV1)
 	default:
 		return nil, fmt.Errorf("%w: %s", yjsbridge.ErrUnknownUpdateFormat, format)
 	}

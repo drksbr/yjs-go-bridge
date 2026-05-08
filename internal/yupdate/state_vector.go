@@ -9,6 +9,14 @@ import (
 // O state vector só avança por cliente enquanto os clocks formam uma sequência
 // contínua iniciada em zero; `Skip` interrompe a contagem para aquele cliente.
 func EncodeStateVectorFromUpdateV1(update []byte) ([]byte, error) {
+	stateVector, err := stateVectorFromUpdateV1(update)
+	if err != nil {
+		return nil, err
+	}
+	return encodeStateVectorMap(stateVector), nil
+}
+
+func stateVectorFromUpdateV1(update []byte) (map[uint32]uint32, error) {
 	reader, err := NewLazyReaderV1(update, false)
 	if err != nil {
 		return nil, err
@@ -16,10 +24,10 @@ func EncodeStateVectorFromUpdateV1(update []byte) ([]byte, error) {
 
 	current := reader.Current()
 	if current == nil {
-		return varint.Append(nil, 0), nil
+		return map[uint32]uint32{}, nil
 	}
 
-	entries := make([][2]uint32, 0)
+	stateVector := make(map[uint32]uint32)
 	currClient := current.ID().Client
 	stopCounting := current.ID().Clock != 0
 	currClock := uint32(0)
@@ -30,7 +38,7 @@ func EncodeStateVectorFromUpdateV1(update []byte) ([]byte, error) {
 	for current != nil {
 		if current.ID().Client != currClient {
 			if currClock != 0 {
-				entries = append(entries, [2]uint32{currClient, currClock})
+				stateVector[currClient] = currClock
 			}
 			currClient = current.ID().Client
 			currClock = 0
@@ -51,15 +59,9 @@ func EncodeStateVectorFromUpdateV1(update []byte) ([]byte, error) {
 	}
 
 	if currClock != 0 {
-		entries = append(entries, [2]uint32{currClient, currClock})
+		stateVector[currClient] = currClock
 	}
-
-	out := varint.Append(nil, uint32(len(entries)))
-	for _, entry := range entries {
-		out = varint.Append(out, entry[0])
-		out = varint.Append(out, entry[1])
-	}
-	return out, nil
+	return stateVector, nil
 }
 
 // DecodeStateVectorV1 interpreta um state vector V1 em memória.

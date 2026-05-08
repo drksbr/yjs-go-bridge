@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -87,6 +88,101 @@ func TestHTTPServerBroadcastsLocalSyncAndAwareness(t *testing.T) {
 	if !bytes.Equal(client.State, []byte(`{"name":"left"}`)) {
 		t.Fatalf("awareness state = %s, want %s", client.State, `{"name":"left"}`)
 	}
+}
+
+func TestWriteBroadcastPeersPrecomputesSyncOutputPayloads(t *testing.T) {
+	t.Parallel()
+
+	updateV1 := buildGCOnlyUpdate(411, 2)
+	payloadV1 := yprotocol.EncodeProtocolSyncUpdate(updateV1)
+	wantV2, err := protocolPayloadForSyncOutputFormat(payloadV1, yjsbridge.UpdateFormatV2)
+	if err != nil {
+		t.Fatalf("protocolPayloadForSyncOutputFormat() unexpected error: %v", err)
+	}
+
+	v1Peer := &recordingRoomPeer{}
+	v2Peer := &recordingRoomPeer{}
+	payloads := newBroadcastPayloads(payloadV1)
+	peers := []roomPeer{
+		v1Peer,
+		syncOutputFormatPeer{base: v2Peer, format: yjsbridge.UpdateFormatV2},
+	}
+	if err := payloads.prepare(peers); err != nil {
+		t.Fatalf("prepare() unexpected error: %v", err)
+	}
+
+	server := &Server{
+		writeTimeout:      time.Second,
+		fanoutConcurrency: 2,
+	}
+	errs := server.writeBroadcastPeers(peers, payloads)
+	for idx, err := range errs {
+		if err != nil {
+			t.Fatalf("writeBroadcastPeers()[%d] error = %v", idx, err)
+		}
+	}
+
+	if got := v1Peer.payload(); !bytes.Equal(got, payloadV1) {
+		t.Fatalf("v1 payload = %x, want %x", got, payloadV1)
+	}
+	if got := v2Peer.payload(); !bytes.Equal(got, wantV2) {
+		t.Fatalf("v2 payload = %x, want %x", got, wantV2)
+	}
+}
+
+func TestProtocolPayloadForSyncOutputFormatKeepsAwarenessPayload(t *testing.T) {
+	t.Parallel()
+
+	payload, err := yprotocol.EncodeProtocolAwarenessUpdate(&yawareness.Update{
+		Clients: []yawareness.ClientState{{
+			ClientID: 778,
+			Clock:    1,
+			State:    json.RawMessage(`{"status":"online"}`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("EncodeProtocolAwarenessUpdate() unexpected error: %v", err)
+	}
+	got, err := protocolPayloadForSyncOutputFormat(payload, yjsbridge.UpdateFormatV2)
+	if err != nil {
+		t.Fatalf("protocolPayloadForSyncOutputFormat() unexpected error: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("awareness payload = %x, want original %x", got, payload)
+	}
+}
+
+type recordingRoomPeer struct {
+	mu     sync.Mutex
+	writes [][]byte
+	closed string
+	err    error
+}
+
+func (p *recordingRoomPeer) deliver(_ context.Context, payload []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.err != nil {
+		return p.err
+	}
+	p.writes = append(p.writes, append([]byte(nil), payload...))
+	return nil
+}
+
+func (p *recordingRoomPeer) close(reason string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = reason
+	return nil
+}
+
+func (p *recordingRoomPeer) payload() []byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.writes) == 0 {
+		return nil
+	}
+	return append([]byte(nil), p.writes[len(p.writes)-1]...)
 }
 
 func TestHTTPServerBootstrapOnConnectSendsExistingAwareness(t *testing.T) {

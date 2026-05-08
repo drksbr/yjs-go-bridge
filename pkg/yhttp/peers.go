@@ -53,12 +53,26 @@ type syncOutputFormatPeer struct {
 	format yjsbridge.UpdateFormat
 }
 
+type preparedSyncOutputPeer interface {
+	roomPeer
+	syncOutputFormat() yjsbridge.UpdateFormat
+	deliverPrepared(ctx context.Context, payload []byte) error
+}
+
 func (p syncOutputFormatPeer) deliver(ctx context.Context, payload []byte) error {
 	converted, err := protocolPayloadForSyncOutputFormat(payload, p.format)
 	if err != nil {
 		return err
 	}
 	return p.base.deliver(ctx, converted)
+}
+
+func (p syncOutputFormatPeer) syncOutputFormat() yjsbridge.UpdateFormat {
+	return p.format
+}
+
+func (p syncOutputFormatPeer) deliverPrepared(ctx context.Context, payload []byte) error {
+	return p.base.deliver(ctx, payload)
 }
 
 func (p syncOutputFormatPeer) close(reason string) error {
@@ -94,6 +108,7 @@ func protocolPayloadForSyncOutputFormat(payload []byte, format yjsbridge.UpdateF
 	if err != nil {
 		return nil, err
 	}
+	convertedAny := false
 	for _, message := range messages {
 		if message == nil || message.Sync == nil {
 			continue
@@ -106,6 +121,10 @@ func protocolPayloadForSyncOutputFormat(payload []byte, format yjsbridge.UpdateF
 			return nil, err
 		}
 		message.Sync.Payload = converted
+		convertedAny = true
+	}
+	if !convertedAny {
+		return payload, nil
 	}
 	return yprotocol.EncodeProtocolEnvelopes(messages...)
 }

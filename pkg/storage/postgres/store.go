@@ -176,7 +176,7 @@ func (s *Store) SaveSnapshotCheckpointAuthoritative(
 		_ = tx.Rollback(context.Background())
 	}()
 
-	if err := s.validateAuthorityTx(ctx, tx, key, fence, time.Now().UTC()); err != nil {
+	if err := s.validateAuthorityWriteTx(ctx, tx, key, fence, time.Now().UTC()); err != nil {
 		return nil, err
 	}
 

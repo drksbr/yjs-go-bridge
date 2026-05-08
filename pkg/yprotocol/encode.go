@@ -3,6 +3,8 @@ package yprotocol
 import (
 	"errors"
 	"fmt"
+
+	internal "github.com/drksbr/yjs-crdt-golang-server/internal/yprotocol"
 )
 
 var (
@@ -16,35 +18,67 @@ var (
 
 // EncodeProtocolEnvelope serializa uma mensagem tipada do envelope y-protocols.
 func EncodeProtocolEnvelope(message *ProtocolMessage) ([]byte, error) {
+	return appendProtocolEnvelope(nil, message)
+}
+
+// EncodeProtocolEnvelopes serializa um stream concatenado de mensagens tipadas.
+func EncodeProtocolEnvelopes(messages ...*ProtocolMessage) ([]byte, error) {
+	dst := make([]byte, 0, protocolEnvelopesSizeHint(messages))
+	for idx, message := range messages {
+		var err error
+		dst, err = appendProtocolEnvelope(dst, message)
+		if err != nil {
+			return nil, fmt.Errorf("encode protocol envelope %d: %w", idx, err)
+		}
+	}
+	return dst, nil
+}
+
+func appendProtocolEnvelope(dst []byte, message *ProtocolMessage) ([]byte, error) {
 	if err := validateProtocolMessage(message); err != nil {
 		return nil, err
 	}
 
 	switch message.Protocol {
 	case ProtocolTypeSync:
-		return EncodeProtocolSyncMessage(message.Sync.Type, message.Sync.Payload)
+		dst = internal.AppendProtocolType(dst, ProtocolTypeSync)
+		return internal.AppendSyncMessage(dst, message.Sync.Type, message.Sync.Payload)
 	case ProtocolTypeAwareness:
-		return EncodeProtocolAwarenessUpdate(message.Awareness)
+		encoded, err := EncodeProtocolAwarenessUpdate(message.Awareness)
+		if err != nil {
+			return nil, err
+		}
+		return append(dst, encoded...), nil
 	case ProtocolTypeAuth:
-		return EncodeProtocolAuthMessage(message.Auth.Type, message.Auth.Reason)
+		dst = internal.AppendProtocolType(dst, ProtocolTypeAuth)
+		return internal.AppendAuthMessage(dst, message.Auth.Type, message.Auth.Reason)
 	case ProtocolTypeQueryAwareness:
-		return EncodeProtocolQueryAwareness(), nil
+		return internal.AppendProtocolType(dst, ProtocolTypeQueryAwareness), nil
 	default:
 		return nil, fmt.Errorf("%w: %d", ErrUnknownProtocolType, message.Protocol)
 	}
 }
 
-// EncodeProtocolEnvelopes serializa um stream concatenado de mensagens tipadas.
-func EncodeProtocolEnvelopes(messages ...*ProtocolMessage) ([]byte, error) {
-	dst := make([]byte, 0)
-	for idx, message := range messages {
-		encoded, err := EncodeProtocolEnvelope(message)
-		if err != nil {
-			return nil, fmt.Errorf("encode protocol envelope %d: %w", idx, err)
+func protocolEnvelopesSizeHint(messages []*ProtocolMessage) int {
+	size := 0
+	for _, message := range messages {
+		if message == nil {
+			continue
 		}
-		dst = append(dst, encoded...)
+		switch {
+		case message.Sync != nil:
+			size += len(message.Sync.Payload) + 8
+		case message.Awareness != nil:
+			for _, client := range message.Awareness.Clients {
+				size += len(client.State) + 16
+			}
+		case message.Auth != nil:
+			size += len(message.Auth.Reason) + 8
+		default:
+			size += 2
+		}
 	}
-	return dst, nil
+	return size
 }
 
 func validateProtocolMessage(message *ProtocolMessage) error {

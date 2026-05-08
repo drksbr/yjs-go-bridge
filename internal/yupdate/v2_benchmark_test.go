@@ -51,6 +51,39 @@ func BenchmarkV2Conversion(b *testing.B) {
 	}
 }
 
+func BenchmarkV2ContentIDs(b *testing.B) {
+	firstV2 := mustDecodeBenchmarkHex(b, "000002a50100000104060374686901020101000001010000")
+	secondV2 := mustDecodeBenchmarkHex(b, "0000048a03a50101020001840301210100000001010000")
+	mergedV2 := mustDecodeBenchmarkHex(b, "0000058a03e501000102000384000408042174686941000201010000020100010000")
+
+	for _, bb := range []struct {
+		name string
+		run  func() (*ContentIDs, error)
+	}{
+		{
+			name: "CreateContentIDsFromUpdate/v2",
+			run: func() (*ContentIDs, error) {
+				return CreateContentIDsFromUpdate(mergedV2)
+			},
+		},
+		{
+			name: "ContentIDsFromUpdates/v2_v2",
+			run: func() (*ContentIDs, error) {
+				return ContentIDsFromUpdates(firstV2, secondV2)
+			},
+		},
+	} {
+		b.Run(bb.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if _, err := bb.run(); err != nil {
+					b.Fatalf("%s unexpected error: %v", bb.name, err)
+				}
+			}
+		})
+	}
+}
+
 func mustDecodeBenchmarkHex(tb testing.TB, value string) []byte {
 	tb.Helper()
 

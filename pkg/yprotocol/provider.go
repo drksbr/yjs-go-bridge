@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -173,10 +172,6 @@ func (p *Provider) Open(ctx context.Context, key storage.DocumentKey, connection
 		clientID: localClientID,
 		session:  NewSession(localClientID),
 	}
-	if err := connection.session.LoadPersistedSnapshot(room.snapshot); err != nil {
-		return nil, err
-	}
-
 	awareness := room.aggregateLocalAwarenessLocked(connectionID)
 	if len(awareness.Clients) > 0 {
 		if _, err := connection.session.HandleProtocolMessage(&ProtocolMessage{
@@ -353,6 +348,12 @@ func (c *Connection) HandleEncodedMessagesContextWithOptions(ctx context.Context
 	if err != nil {
 		return nil, err
 	}
+	if len(messages) == 1 && messages[0] != nil &&
+		messages[0].Protocol == ProtocolTypeSync &&
+		messages[0].Sync != nil &&
+		messages[0].Sync.Type == SyncMessageTypeStep1 {
+		return c.handleSyncStep1Only(ctx, messages[0], opts)
+	}
 
 	c.room.mu.Lock()
 	defer c.room.mu.Unlock()
@@ -385,6 +386,48 @@ func (c *Connection) HandleEncodedMessagesContextWithOptions(ctx context.Context
 	}
 	result.Direct = encodedDirect
 	return result, nil
+}
+
+func (c *Connection) handleSyncStep1Only(ctx context.Context, message *ProtocolMessage, opts ConnectionHandleOptions) (*DispatchResult, error) {
+	if err := validateProtocolMessage(message); err != nil {
+		return nil, err
+	}
+
+	room := c.room
+	if room == nil {
+		return nil, ErrConnectionClosed
+	}
+	room.mu.Lock()
+	if c.closed {
+		room.mu.Unlock()
+		return nil, ErrConnectionClosed
+	}
+	if room.authorityLost {
+		room.mu.Unlock()
+		return nil, ErrAuthorityLost
+	}
+	var updateV1 []byte
+	if room.snapshot != nil {
+		updateV1 = room.snapshot.UpdateV1
+	}
+	updateV2 := room.updateV2
+	room.mu.Unlock()
+
+	diff, err := diffForSyncOutputFormatFromUpdates(ctx, updateV1, updateV2, message.Sync.Payload, opts.DirectSyncOutputFormat)
+	if err != nil {
+		return nil, err
+	}
+	encodedDirect, err := EncodeProtocolEnvelope(&ProtocolMessage{
+		Protocol: ProtocolTypeSync,
+		Sync: &SyncMessage{
+			Type:    SyncMessageTypeStep2,
+			Payload: diff,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &DispatchResult{Direct: encodedDirect}, nil
 }
 
 func validateConnectionHandleOptions(opts ConnectionHandleOptions) error {
@@ -490,7 +533,7 @@ func (c *Connection) Close() (*DispatchResult, error) {
 			Protocol:  ProtocolTypeAwareness,
 			Awareness: tombstone,
 		}
-		for _, peer := range room.sortedConnectionsLocked() {
+		for _, peer := range room.connections {
 			if peer.id == c.id || peer.closed {
 				continue
 			}
@@ -536,10 +579,10 @@ func (p *Provider) ensureRoom(ctx context.Context, key storage.DocumentKey) (*pr
 		p.mu.Unlock()
 		return room, nil
 	}
+	p.mu.Unlock()
 
 	authority, err := p.resolveRoomAuthority(ctx, key)
 	if err != nil {
-		p.mu.Unlock()
 		if errors.Is(err, ErrAuthorityLost) {
 			observeAuthorityLost(p.metrics, key, authorityLossStageOpen)
 		}
@@ -548,12 +591,10 @@ func (p *Provider) ensureRoom(ctx context.Context, key storage.DocumentKey) (*pr
 
 	snapshot, lastOffset, compactedAt, err := p.loadSnapshot(ctx, key)
 	if err != nil {
-		p.mu.Unlock()
 		return nil, err
 	}
 	updateV2, err := persistedSnapshotUpdateV2(snapshot)
 	if err != nil {
-		p.mu.Unlock()
 		return nil, err
 	}
 
@@ -565,6 +606,11 @@ func (p *Provider) ensureRoom(ctx context.Context, key storage.DocumentKey) (*pr
 		compactedAt: compactedAt,
 		authority:   authority,
 		connections: make(map[string]*Connection),
+	}
+	p.mu.Lock()
+	if current, ok := p.rooms[key]; ok {
+		p.mu.Unlock()
+		return current, nil
 	}
 	p.rooms[key] = room
 	p.mu.Unlock()
@@ -581,7 +627,7 @@ func (p *Provider) loadSnapshot(ctx context.Context, key storage.DocumentKey) (*
 	}
 
 	if updateStore := p.updateLogStore(); updateStore != nil {
-		recovered, err := storage.RecoverSnapshot(ctx, p.store, updateStore, key, 0, 0)
+		recovered, err := storage.RecoverSnapshotStateContext(ctx, p.store, updateStore, key, 0, 0)
 		if err != nil {
 			return nil, 0, 0, err
 		}
@@ -773,7 +819,11 @@ func (r *providerRoom) handleMessageLocked(ctx context.Context, sender *Connecti
 			return nil, nil, fmt.Errorf("%w: %d", ErrUnknownSyncMessageType, message.Sync.Type)
 		}
 
-		diff, err := diffForSyncOutputFormat(r.updateV2, message.Sync.Payload, opts.DirectSyncOutputFormat)
+		var updateV1 []byte
+		if r.snapshot != nil {
+			updateV1 = r.snapshot.UpdateV1
+		}
+		diff, err := diffForSyncOutputFormatFromUpdates(ctx, updateV1, r.updateV2, message.Sync.Payload, opts.DirectSyncOutputFormat)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -788,7 +838,7 @@ func (r *providerRoom) handleMessageLocked(ctx context.Context, sender *Connecti
 		if _, err := sender.session.HandleProtocolMessage(message); err != nil {
 			return nil, nil, err
 		}
-		for _, peer := range r.sortedConnectionsLocked() {
+		for _, peer := range r.connections {
 			if peer.id == sender.id || peer.closed {
 				continue
 			}
@@ -866,7 +916,7 @@ func (r *providerRoom) applyDocumentPayloadLocked(ctx context.Context, provider 
 		}
 	}
 
-	nextSnapshot, err := storage.ReplaySnapshot(context.Background(), r.snapshot, &storage.UpdateLogRecord{
+	nextSnapshot, err := storage.ReplaySnapshot(ctx, r.snapshot, &storage.UpdateLogRecord{
 		Key:      key,
 		UpdateV2: updateV2,
 		UpdateV1: updateV1,
@@ -891,31 +941,15 @@ func (r *providerRoom) applyDocumentPayloadLocked(ctx context.Context, provider 
 		}
 		r.lastOffset = lastOffset
 		r.compactedAt = compactedAt
-		return r.updateV2, r.syncSessionsToSnapshotLocked()
+		return r.updateV2, nil
 	}
 
-	nextUpdateV2, err := yjsbridge.MergeUpdatesV2(r.updateV2, updateV2)
-	if err != nil {
-		return nil, err
-	}
 	r.snapshot = nextSnapshot
-	r.updateV2 = nextUpdateV2
+	r.updateV2 = append([]byte(nil), nextSnapshot.UpdateV2...)
 	if appendedOffset > 0 {
 		r.lastOffset = appendedOffset
 	}
-	return updateV2, r.syncSessionsToSnapshotLocked()
-}
-
-func (r *providerRoom) syncSessionsToSnapshotLocked() error {
-	for _, peer := range r.sortedConnectionsLocked() {
-		if peer.closed {
-			continue
-		}
-		if err := peer.session.LoadPersistedSnapshot(r.snapshot); err != nil {
-			return err
-		}
-	}
-	return nil
+	return updateV2, nil
 }
 
 func persistedSnapshotUpdateV2(snapshot *yjsbridge.PersistedSnapshot) ([]byte, error) {
@@ -930,12 +964,13 @@ func persistedSnapshotUpdateV2(snapshot *yjsbridge.PersistedSnapshot) ([]byte, e
 }
 
 func (r *providerRoom) aggregateLocalAwarenessLocked(excludeConnectionID string) *yawareness.Update {
-	clients := make([]yawareness.ClientState, 0)
-	for _, connection := range r.sortedConnectionsLocked() {
+	clients := make([]yawareness.ClientState, 0, len(r.connections))
+	for _, connection := range r.connections {
 		if connection.id == excludeConnectionID || connection.closed {
 			continue
 		}
-		update := connection.session.Awareness().UpdateForClients([]uint32{connection.clientID})
+		clientIDs := [1]uint32{connection.clientID}
+		update := connection.session.Awareness().UpdateForClients(clientIDs[:])
 		if update == nil || len(update.Clients) == 0 {
 			continue
 		}
@@ -948,20 +983,6 @@ func (r *providerRoom) aggregateLocalAwarenessLocked(excludeConnectionID string)
 		}
 	}
 	return &yawareness.Update{Clients: clients}
-}
-
-func (r *providerRoom) sortedConnectionsLocked() []*Connection {
-	keys := make([]string, 0, len(r.connections))
-	for key := range r.connections {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	out := make([]*Connection, 0, len(keys))
-	for _, key := range keys {
-		out = append(out, r.connections[key])
-	}
-	return out
 }
 
 func (c *Connection) localAwarenessTombstone() *yawareness.Update {

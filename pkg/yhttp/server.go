@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/storage"
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/ycluster"
+	"github.com/drksbr/yjs-crdt-golang-server/pkg/yjsbridge"
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/ynodeproto"
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/yprotocol"
 )
@@ -28,6 +30,7 @@ type Server struct {
 	readLimitBytes                int64
 	writeTimeout                  time.Duration
 	persistTimeout                time.Duration
+	fanoutConcurrency             int
 	bootstrapOnConnect            bool
 	authorityRevalidationInterval time.Duration
 	authenticator                 Authenticator
@@ -112,6 +115,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if persistTimeout <= 0 {
 		persistTimeout = defaultPersistTimeout
 	}
+	fanoutConcurrency := cfg.FanoutConcurrency
+	if fanoutConcurrency <= 0 {
+		fanoutConcurrency = defaultFanoutConcurrency
+	}
 
 	metrics := normalizeMetrics(cfg.Metrics)
 	if cfg.Redactor != nil {
@@ -126,6 +133,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		readLimitBytes:                readLimit,
 		writeTimeout:                  writeTimeout,
 		persistTimeout:                persistTimeout,
+		fanoutConcurrency:             fanoutConcurrency,
 		bootstrapOnConnect:            cfg.BootstrapOnConnect,
 		authorityRevalidationInterval: cfg.AuthorityRevalidationInterval,
 		authenticator:                 cfg.Authenticator,
@@ -782,13 +790,23 @@ func (s *Server) pipeClientToLocal(
 }
 
 func (s *Server) fanout(r *http.Request, req Request, payload []byte) {
-	for _, peer := range s.registry.peersExcept(req.DocumentKey, req.ConnectionID) {
-		if err := s.writeBinary(peer, payload); err != nil {
-			if !isIgnorableTransportError(err) {
-				s.metrics.Error(req, "write_broadcast", err)
-				s.report(r, req, err)
+	peers := s.registry.peersExcept(req.DocumentKey, req.ConnectionID)
+	if len(peers) == 0 {
+		return
+	}
+	payloads := newBroadcastPayloads(payload)
+	if err := payloads.prepare(peers); err != nil {
+		s.metrics.Error(req, "prepare_broadcast", err)
+		s.report(r, req, err)
+	}
+	results := s.writeBroadcastPeers(peers, payloads)
+	for idx, result := range results {
+		if result != nil {
+			if !isIgnorableTransportError(result) {
+				s.metrics.Error(req, "write_broadcast", result)
+				s.report(r, req, result)
 			}
-			if closeErr := peer.close("falha ao entregar broadcast local"); closeErr != nil {
+			if closeErr := peers[idx].close("falha ao entregar broadcast local"); closeErr != nil {
 				if isIgnorableTransportError(closeErr) {
 					continue
 				}
@@ -799,6 +817,78 @@ func (s *Server) fanout(r *http.Request, req Request, payload []byte) {
 		}
 		s.metrics.FrameWritten(req, "broadcast", len(payload))
 	}
+}
+
+type broadcastPayloads struct {
+	v1    []byte
+	v2    []byte
+	v2Err error
+}
+
+func newBroadcastPayloads(payload []byte) *broadcastPayloads {
+	return &broadcastPayloads{v1: payload}
+}
+
+func (p *broadcastPayloads) prepare(peers []roomPeer) error {
+	for _, peer := range peers {
+		if prepared, ok := peer.(preparedSyncOutputPeer); ok && prepared.syncOutputFormat() == yjsbridge.UpdateFormatV2 {
+			p.v2, p.v2Err = protocolPayloadForSyncOutputFormat(p.v1, yjsbridge.UpdateFormatV2)
+			return p.v2Err
+		}
+	}
+	return nil
+}
+
+func (p *broadcastPayloads) payloadFor(peer roomPeer) ([]byte, error) {
+	if prepared, ok := peer.(preparedSyncOutputPeer); ok && prepared.syncOutputFormat() == yjsbridge.UpdateFormatV2 {
+		return p.v2, p.v2Err
+	}
+	return p.v1, nil
+}
+
+func (s *Server) writeBroadcastPeers(peers []roomPeer, payloads *broadcastPayloads) []error {
+	errs := make([]error, len(peers))
+	concurrency := s.fanoutConcurrency
+	if concurrency <= 1 || len(peers) <= fanoutParallelThreshold {
+		for idx, peer := range peers {
+			errs[idx] = s.writeBroadcastPeer(peer, payloads)
+		}
+		return errs
+	}
+	if concurrency > len(peers) {
+		concurrency = len(peers)
+	}
+
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for worker := 0; worker < concurrency; worker++ {
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				errs[idx] = s.writeBroadcastPeer(peers[idx], payloads)
+			}
+		}()
+	}
+	for idx := range peers {
+		jobs <- idx
+	}
+	close(jobs)
+	wg.Wait()
+	return errs
+}
+
+func (s *Server) writeBroadcastPeer(peer roomPeer, payloads *broadcastPayloads) error {
+	payload, err := payloads.payloadFor(peer)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.writeTimeout)
+	defer cancel()
+	if prepared, ok := peer.(preparedSyncOutputPeer); ok {
+		return prepared.deliverPrepared(ctx, payload)
+	}
+	return peer.deliver(ctx, payload)
 }
 
 func (s *Server) writeBinary(peer roomPeer, payload []byte) error {

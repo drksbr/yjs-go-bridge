@@ -170,7 +170,7 @@ func newStringDecoderV2(data []byte, op string) (*stringDecoderV2, error) {
 	}
 	return &stringDecoderV2{
 		lengths: newUintOptRleDecoder(remaining, op+".lengths"),
-		units:   utf16.Encode([]rune(value)),
+		units:   encodeUTF16Units(value),
 		op:      op,
 	}, nil
 }
@@ -199,6 +199,20 @@ func (d *stringDecoderV2) ensureDrained() error {
 		return wrapError(d.op+".trailing", d.pos, ErrTrailingBytes)
 	}
 	return d.lengths.ensureDrained()
+}
+
+func encodeUTF16Units(value string) []uint16 {
+	units := make([]uint16, 0, utf16Length(value))
+	for _, current := range value {
+		switch {
+		case current <= 0xffff:
+			units = append(units, uint16(current))
+		default:
+			r1, r2 := utf16.EncodeRune(current)
+			units = append(units, uint16(r1), uint16(r2))
+		}
+	}
+	return units
 }
 
 func floorDiv2(value int64) int64 {
@@ -273,6 +287,16 @@ func readLib0VarString(reader *ybinary.Reader, op string) (string, error) {
 }
 
 func readLib0VarUint8Array(reader *ybinary.Reader, op string) ([]byte, error) {
+	data, err := readLib0VarUint8ArrayView(reader, op)
+	if err != nil {
+		return nil, err
+	}
+	copied := make([]byte, len(data))
+	copy(copied, data)
+	return copied, nil
+}
+
+func readLib0VarUint8ArrayView(reader *ybinary.Reader, op string) ([]byte, error) {
 	length, err := readLib0VarUint(reader, op+".len")
 	if err != nil {
 		return nil, err
@@ -282,9 +306,7 @@ func readLib0VarUint8Array(reader *ybinary.Reader, op string) ([]byte, error) {
 	if err != nil {
 		return nil, wrapError(op, reader.Offset(), err)
 	}
-	copied := make([]byte, len(data))
-	copy(copied, data)
-	return copied, nil
+	return data, nil
 }
 
 func readLib0VarIntRaw(reader *ybinary.Reader, op string) ([]byte, error) {

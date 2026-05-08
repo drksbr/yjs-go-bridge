@@ -35,6 +35,14 @@ func (ds *DeleteSet) IsEmpty() bool {
 	return ds == nil || ds.ids == nil || ds.ids.IsEmpty()
 }
 
+// ClientCount returns the number of clients with deletions.
+func (ds *DeleteSet) ClientCount() int {
+	if ds == nil || ds.ids == nil {
+		return 0
+	}
+	return ds.ids.ClientCount()
+}
+
 // Add registra uma deleção normalizando overlaps e adjacências.
 func (ds *DeleteSet) Add(client, clock, length uint32) error {
 	return normalizeDeleteSetError(ds.ensure().Add(client, clock, length))
@@ -75,6 +83,28 @@ func (ds *DeleteSet) Ranges(client uint32) []DeleteRange {
 		return nil
 	}
 	return ds.ids.Ranges(client)
+}
+
+// ForEachClient iterates clients in ascending order and exposes normalized
+// ranges for read-only use.
+func (ds *DeleteSet) ForEachClient(fn func(client uint32, ranges []DeleteRange)) {
+	if ds == nil || ds.ids == nil {
+		return
+	}
+	ds.ids.ForEachClient(func(client uint32, ranges []yidset.Range) {
+		fn(client, ranges)
+	})
+}
+
+// ForEachClientDesc iterates clients in descending order and exposes normalized
+// ranges for read-only use.
+func (ds *DeleteSet) ForEachClientDesc(fn func(client uint32, ranges []DeleteRange)) {
+	if ds == nil || ds.ids == nil {
+		return
+	}
+	ds.ids.ForEachClientDesc(func(client uint32, ranges []yidset.Range) {
+		fn(client, ranges)
+	})
 }
 
 func (ds *DeleteSet) ensure() *yidset.Set {

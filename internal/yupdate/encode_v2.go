@@ -203,13 +203,9 @@ func (e *updateEncoderV2) writeContent(content ParsedContent) error {
 }
 
 func (e *updateEncoderV2) writeDeleteSet(ds *ytypes.DeleteSet) {
-	clients := ds.Clients()
-	slices.Reverse(clients)
-
-	e.rest = appendVarUintV1(e.rest, uint32(len(clients)))
-	for _, client := range clients {
+	e.rest = appendVarUintV1(e.rest, uint32(ds.ClientCount()))
+	ds.ForEachClientDesc(func(client uint32, ranges []ytypes.DeleteRange) {
 		e.rest = appendVarUintV1(e.rest, client)
-		ranges := ds.Ranges(client)
 		e.rest = appendVarUintV1(e.rest, uint32(len(ranges)))
 		current := uint32(0)
 		for _, r := range ranges {
@@ -217,7 +213,7 @@ func (e *updateEncoderV2) writeDeleteSet(ds *ytypes.DeleteSet) {
 			e.rest = appendVarUintV1(e.rest, r.Length-1)
 			current = r.Clock + r.Length
 		}
-	}
+	})
 }
 
 func (e *updateEncoderV2) bytes() []byte {

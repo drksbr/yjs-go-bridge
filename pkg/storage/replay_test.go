@@ -36,6 +36,7 @@ type testSnapshotLogStore struct {
 	savedEpoch     uint64
 	lastFence      AuthorityFence
 	listAfters     []UpdateOffset
+	listLimits     []int
 }
 
 var _ SnapshotLogStore = (*testSnapshotLogStore)(nil)
@@ -94,6 +95,7 @@ func (s *testSnapshotLogStore) AppendUpdateAuthoritative(ctx context.Context, ke
 func (s *testSnapshotLogStore) ListUpdates(_ context.Context, _ DocumentKey, after UpdateOffset, limit int) ([]*UpdateLogRecord, error) {
 	s.listCalls++
 	s.listAfters = append(s.listAfters, after)
+	s.listLimits = append(s.listLimits, limit)
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
@@ -451,6 +453,87 @@ func TestRecoverSnapshotPagesTailAndClonesUpdates(t *testing.T) {
 	}
 }
 
+func TestRecoverSnapshotStatePagesTailWithoutRetainingUpdates(t *testing.T) {
+	t.Parallel()
+
+	key := DocumentKey{Namespace: "tenant-a", DocumentID: "doc-state"}
+	baseUpdate := buildGCOnlyUpdate(20, 1)
+	left := buildGCOnlyUpdate(21, 2)
+	right := buildGCOnlyUpdate(22, 1)
+
+	store := &testSnapshotLogStore{
+		snapshot: &SnapshotRecord{
+			Key:      key,
+			Snapshot: mustPersistedSnapshotFromUpdates(t, baseUpdate),
+			Through:  5,
+			Epoch:    2,
+			StoredAt: time.Unix(100, 0).UTC(),
+		},
+		records: []*UpdateLogRecord{
+			{Key: key, Offset: 3, UpdateV1: buildGCOnlyUpdate(19, 1)},
+			{Key: key, Offset: 7, UpdateV1: left, Epoch: 2},
+			{Key: key, Offset: 9, UpdateV1: right, Epoch: 3},
+		},
+	}
+
+	got, err := RecoverSnapshotStateContext(context.Background(), store, store, key, 0, 1)
+	if err != nil {
+		t.Fatalf("RecoverSnapshotStateContext() unexpected error: %v", err)
+	}
+
+	want := mustPersistedSnapshotFromUpdates(t, baseUpdate, left, right)
+	if got.CheckpointThrough != 5 {
+		t.Fatalf("RecoverSnapshotStateContext().CheckpointThrough = %d, want 5", got.CheckpointThrough)
+	}
+	if got.CheckpointEpoch != 2 {
+		t.Fatalf("RecoverSnapshotStateContext().CheckpointEpoch = %d, want 2", got.CheckpointEpoch)
+	}
+	if got.LastOffset != 9 {
+		t.Fatalf("RecoverSnapshotStateContext().LastOffset = %d, want 9", got.LastOffset)
+	}
+	if got.LastEpoch != 3 {
+		t.Fatalf("RecoverSnapshotStateContext().LastEpoch = %d, want 3", got.LastEpoch)
+	}
+	if got.Applied != 2 {
+		t.Fatalf("RecoverSnapshotStateContext().Applied = %d, want 2", got.Applied)
+	}
+	if !bytes.Equal(got.Snapshot.UpdateV1, want.UpdateV1) {
+		t.Fatalf("RecoverSnapshotStateContext().Snapshot.UpdateV1 = %v, want %v", got.Snapshot.UpdateV1, want.UpdateV1)
+	}
+	if store.listCalls != 3 {
+		t.Fatalf("ListUpdates() calls = %d, want 3", store.listCalls)
+	}
+	if len(store.listAfters) == 0 || store.listAfters[0] != 5 {
+		t.Fatalf("ListUpdates() first after = %#v, want first call after 5", store.listAfters)
+	}
+}
+
+func TestRecoverSnapshotStateUsesDefaultPageLimit(t *testing.T) {
+	t.Parallel()
+
+	key := DocumentKey{DocumentID: "doc-state-default-limit"}
+	store := &testSnapshotLogStore{
+		records: []*UpdateLogRecord{
+			{Key: key, Offset: 1, UpdateV1: buildGCOnlyUpdate(31, 1)},
+			{Key: key, Offset: 2, UpdateV1: buildGCOnlyUpdate(32, 1)},
+		},
+	}
+
+	got, err := RecoverSnapshotStateContext(context.Background(), nil, store, key, 0, 0)
+	if err != nil {
+		t.Fatalf("RecoverSnapshotStateContext() unexpected error: %v", err)
+	}
+	if got.Applied != 2 {
+		t.Fatalf("RecoverSnapshotStateContext().Applied = %d, want 2", got.Applied)
+	}
+	if store.listCalls != 2 {
+		t.Fatalf("ListUpdates() calls = %d, want 2", store.listCalls)
+	}
+	if len(store.listLimits) == 0 || store.listLimits[0] != defaultRecoverSnapshotStateLimit {
+		t.Fatalf("ListUpdates() first limit = %#v, want %d", store.listLimits, defaultRecoverSnapshotStateLimit)
+	}
+}
+
 func TestRecoverSnapshotWithoutSnapshotOrUpdates(t *testing.T) {
 	t.Parallel()
 
@@ -656,6 +739,29 @@ func TestCompactUpdateLogContextReturnsPartialResultOnTrimError(t *testing.T) {
 	}
 }
 
+func TestCompactUpdateLogContextUsesDefaultPageLimit(t *testing.T) {
+	t.Parallel()
+
+	key := DocumentKey{DocumentID: "doc-compact-default-limit"}
+	store := &testSnapshotLogStore{
+		records: []*UpdateLogRecord{
+			{Key: key, Offset: 1, UpdateV1: buildGCOnlyUpdate(54, 1)},
+			{Key: key, Offset: 2, UpdateV1: buildGCOnlyUpdate(55, 1)},
+		},
+	}
+
+	got, err := CompactUpdateLogContext(context.Background(), store, key, nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CompactUpdateLogContext() unexpected error: %v", err)
+	}
+	if got.Applied != 2 {
+		t.Fatalf("CompactUpdateLogContext().Applied = %d, want 2", got.Applied)
+	}
+	if len(store.listLimits) == 0 || store.listLimits[0] != defaultRecoverSnapshotStateLimit {
+		t.Fatalf("ListUpdates() first limit = %#v, want %d", store.listLimits, defaultRecoverSnapshotStateLimit)
+	}
+}
+
 func TestCompactUpdateLogAuthoritativeContextSavesSnapshotAndTrimsTailWithFence(t *testing.T) {
 	t.Parallel()
 
@@ -798,6 +904,37 @@ func TestCompactUpdateLogAuthoritativeContextReturnsPartialResultOnTrimError(t *
 	}
 	if store.trimAuthoritativeCalls != 1 {
 		t.Fatalf("TrimUpdatesAuthoritative() calls = %d, want 1", store.trimAuthoritativeCalls)
+	}
+}
+
+func TestCompactUpdateLogAuthoritativeContextUsesDefaultPageLimit(t *testing.T) {
+	t.Parallel()
+
+	key := DocumentKey{DocumentID: "doc-compact-authoritative-default-limit"}
+	fence := AuthorityFence{
+		ShardID: ShardID("10"),
+		Owner: OwnerInfo{
+			NodeID: NodeID("node-a"),
+			Epoch:  12,
+		},
+		Token: "lease-node-a",
+	}
+	store := &testSnapshotLogStore{
+		records: []*UpdateLogRecord{
+			{Key: key, Offset: 1, UpdateV1: buildGCOnlyUpdate(64, 1), Epoch: 12},
+			{Key: key, Offset: 2, UpdateV1: buildGCOnlyUpdate(65, 1), Epoch: 12},
+		},
+	}
+
+	got, err := CompactUpdateLogAuthoritativeContext(context.Background(), store, key, nil, 0, 0, fence)
+	if err != nil {
+		t.Fatalf("CompactUpdateLogAuthoritativeContext() unexpected error: %v", err)
+	}
+	if got.Applied != 2 {
+		t.Fatalf("CompactUpdateLogAuthoritativeContext().Applied = %d, want 2", got.Applied)
+	}
+	if len(store.listLimits) == 0 || store.listLimits[0] != defaultRecoverSnapshotStateLimit {
+		t.Fatalf("ListUpdates() first limit = %#v, want %d", store.listLimits, defaultRecoverSnapshotStateLimit)
 	}
 }
 

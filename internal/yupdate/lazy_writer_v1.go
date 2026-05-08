@@ -1,21 +1,13 @@
 package yupdate
 
-import (
-	"bytes"
-
-	"github.com/drksbr/yjs-crdt-golang-server/internal/ytypes"
-)
-
-type lazyWriterFragmentV1 struct {
-	written uint32
-	payload []byte
-}
+import "github.com/drksbr/yjs-crdt-golang-server/internal/ytypes"
 
 type lazyWriterV1 struct {
-	currClient uint32
-	written    uint32
-	current    []byte
-	fragments  []lazyWriterFragmentV1
+	currClient    uint32
+	written       uint32
+	fragmentCount uint32
+	current       []byte
+	body          []byte
 }
 
 func newLazyWriterV1() *lazyWriterV1 {
@@ -48,11 +40,8 @@ func (w *lazyWriterV1) write(current ytypes.Struct, startOffset, endTrim uint32)
 func (w *lazyWriterV1) finish(dst []byte) ([]byte, error) {
 	w.flush()
 
-	dst = appendVarUintV1(dst, uint32(len(w.fragments)))
-	for _, fragment := range w.fragments {
-		dst = appendVarUintV1(dst, fragment.written)
-		dst = append(dst, fragment.payload...)
-	}
+	dst = appendVarUintV1(dst, w.fragmentCount)
+	dst = append(dst, w.body...)
 	w.reset()
 	return dst, nil
 }
@@ -61,10 +50,9 @@ func (w *lazyWriterV1) flush() {
 	if w.written == 0 {
 		return
 	}
-	w.fragments = append(w.fragments, lazyWriterFragmentV1{
-		written: w.written,
-		payload: bytes.Clone(w.current),
-	})
+	w.body = appendVarUintV1(w.body, w.written)
+	w.body = append(w.body, w.current...)
+	w.fragmentCount++
 	w.current = w.current[:0]
 	w.written = 0
 }
@@ -72,8 +60,9 @@ func (w *lazyWriterV1) flush() {
 func (w *lazyWriterV1) reset() {
 	w.currClient = 0
 	w.written = 0
+	w.fragmentCount = 0
 	w.current = w.current[:0]
-	w.fragments = w.fragments[:0]
+	w.body = w.body[:0]
 }
 
 func appendStructRangeV1(dst []byte, current ytypes.Struct, startOffset, endTrim uint32) ([]byte, error) {

@@ -37,6 +37,34 @@ func (s *IdSet) IsEmpty() bool {
 	return len(s.clients) == 0
 }
 
+// ClientCount returns the number of clients with at least one range.
+func (s *IdSet) ClientCount() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.clients)
+}
+
+// RangeCount returns the number of ranges for a client.
+func (s *IdSet) RangeCount(client uint32) int {
+	if s == nil {
+		return 0
+	}
+	return len(s.clients[client])
+}
+
+// TotalRangeCount returns the total number of ranges across all clients.
+func (s *IdSet) TotalRangeCount() int {
+	if s == nil {
+		return 0
+	}
+	total := 0
+	for _, ranges := range s.clients {
+		total += len(ranges)
+	}
+	return total
+}
+
 // Add insere um range para client, normalizando overlaps e adjacências.
 func (s *IdSet) Add(client, clock, length uint32) error {
 	if s == nil {
@@ -54,6 +82,17 @@ func (s *IdSet) Add(client, clock, length uint32) error {
 	ranges := s.clients[client]
 	if len(ranges) == 0 {
 		s.clients[client] = []Range{next}
+		return nil
+	}
+	lastIdx := len(ranges) - 1
+	last := ranges[lastIdx]
+	if next.Clock >= last.Clock {
+		if last.End() < uint64(next.Clock) {
+			s.clients[client] = append(ranges, next)
+			return nil
+		}
+		ranges[lastIdx] = mergeRanges(last, next)
+		s.clients[client] = ranges
 		return nil
 	}
 
@@ -99,8 +138,18 @@ func (s *IdSet) Merge(other *IdSet) error {
 	if s == nil || other == nil {
 		return nil
 	}
+	if s.clients == nil {
+		s.clients = make(map[uint32][]Range, len(other.clients))
+	}
 
 	for client, ranges := range other.clients {
+		if len(ranges) == 0 {
+			continue
+		}
+		if _, ok := s.clients[client]; !ok {
+			s.clients[client] = slices.Clone(ranges)
+			continue
+		}
 		for _, r := range ranges {
 			if err := s.Add(client, r.Clock, r.Length); err != nil {
 				return err
@@ -166,15 +215,51 @@ func (s *IdSet) Ranges(client uint32) []Range {
 	return slices.Clone(s.clients[client])
 }
 
+// ForEachClient iterates clients in ascending order and exposes their internal
+// normalized ranges for read-only use.
+func (s *IdSet) ForEachClient(fn func(client uint32, ranges []Range)) {
+	if s == nil || fn == nil {
+		return
+	}
+	if len(s.clients) <= 1 {
+		for client, ranges := range s.clients {
+			fn(client, ranges)
+		}
+		return
+	}
+	for _, client := range s.Clients() {
+		fn(client, s.clients[client])
+	}
+}
+
+// ForEachClientDesc iterates clients in descending order and exposes their
+// internal normalized ranges for read-only use.
+func (s *IdSet) ForEachClientDesc(fn func(client uint32, ranges []Range)) {
+	if s == nil || fn == nil {
+		return
+	}
+	if len(s.clients) <= 1 {
+		for client, ranges := range s.clients {
+			fn(client, ranges)
+		}
+		return
+	}
+	clients := s.Clients()
+	for idx := len(clients) - 1; idx >= 0; idx-- {
+		client := clients[idx]
+		fn(client, s.clients[client])
+	}
+}
+
 // ForEach percorre os ranges em ordem determinística por client e clock.
 func (s *IdSet) ForEach(fn func(client uint32, r Range)) {
 	if s == nil {
 		return
 	}
 
-	for _, client := range s.Clients() {
-		for _, r := range s.clients[client] {
+	s.ForEachClient(func(client uint32, ranges []Range) {
+		for _, r := range ranges {
 			fn(client, r)
 		}
-	}
+	})
 }

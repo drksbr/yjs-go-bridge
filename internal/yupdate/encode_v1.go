@@ -112,12 +112,23 @@ func appendItemV1(dst []byte, item *ytypes.Item) ([]byte, error) {
 }
 
 func groupStructsByClient(structs []ytypes.Struct) map[uint32][]ytypes.Struct {
-	groups := make(map[uint32][]ytypes.Struct)
+	capacity := len(structs)
+	if capacity > 64 {
+		capacity = 64
+	}
+	groups := make(map[uint32][]ytypes.Struct, capacity)
+	var needsSort map[uint32]bool
 	for _, current := range structs {
 		client := current.ID().Client
+		if group := groups[client]; len(group) > 0 && group[len(group)-1].ID().Clock > current.ID().Clock {
+			if needsSort == nil {
+				needsSort = make(map[uint32]bool)
+			}
+			needsSort[client] = true
+		}
 		groups[client] = append(groups[client], current)
 	}
-	for client := range groups {
+	for client := range needsSort {
 		slices.SortStableFunc(groups[client], func(a, b ytypes.Struct) int {
 			switch {
 			case a.ID().Clock < b.ID().Clock:

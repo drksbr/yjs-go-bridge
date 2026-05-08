@@ -41,6 +41,40 @@ func TestAggregatePayloadsInParallelReturnsContextCanceledWithoutReducer(t *test
 	}
 }
 
+func TestAggregatePayloadsInParallelUsesSequentialFastPathForSmallBatch(t *testing.T) {
+	t.Parallel()
+
+	var extracted []int
+	got, err := aggregatePayloadsInParallel(
+		context.Background(),
+		[][]byte{{0x01}, {0x02}, {0x03}},
+		0,
+		func(_ context.Context, index int, payload []byte) (int, error) {
+			if len(payload) != 1 {
+				t.Fatalf("payload[%d] len = %d, want 1", index, len(payload))
+			}
+			extracted = append(extracted, index)
+			return int(payload[0]), nil
+		},
+		func(_ context.Context, values []int) (int, error) {
+			total := 0
+			for _, value := range values {
+				total += value
+			}
+			return total, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("aggregatePayloadsInParallel() unexpected error: %v", err)
+	}
+	if got != 6 {
+		t.Fatalf("aggregatePayloadsInParallel() value = %d, want 6", got)
+	}
+	if want := []int{0, 1, 2}; !equalIntSlices(extracted, want) {
+		t.Fatalf("extract order = %v, want %v", extracted, want)
+	}
+}
+
 func TestStateVectorFromUpdatesContextRespectsCanceledContext(t *testing.T) {
 	t.Parallel()
 
@@ -61,6 +95,18 @@ func TestStateVectorFromUpdatesContextRespectsCanceledContext(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("StateVectorFromUpdatesContext() error = %v, want context.Canceled", err)
 	}
+}
+
+func equalIntSlices(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestContentIDsFromUpdatesContextRespectsCanceledContext(t *testing.T) {

@@ -207,9 +207,7 @@ func TestProviderHandleEncodedMessagesBatchedEnvelope(t *testing.T) {
 		t.Fatalf("broadcast awareness state = %s, want %s", broadcastStates[sender.ClientID()], presenceState)
 	}
 
-	if !bytes.Equal(peer.session.UpdateV1(), update) {
-		t.Fatalf("peer.session.UpdateV1() = %v, want %v", peer.session.UpdateV1(), update)
-	}
+	assertConnectionSyncStep2EquivalentToV1(t, peer, update)
 	peerAwareness, ok := peer.session.Awareness().Get(sender.ClientID())
 	if !ok {
 		t.Fatal("peer.session.Awareness().Get() = missing, want sender awareness applied from batch")
@@ -282,12 +280,8 @@ func TestProviderSyncUpdateNormalizesV2BroadcastAndRoomState(t *testing.T) {
 	if bytes.Equal(broadcastMessages[0].Sync.Payload, v2Update) {
 		t.Fatalf("broadcast sync payload preserved V2 bytes: %x", broadcastMessages[0].Sync.Payload)
 	}
-	if !bytes.Equal(sender.session.UpdateV1(), v1Update) {
-		t.Fatalf("sender.session.UpdateV1() = %x, want %x", sender.session.UpdateV1(), v1Update)
-	}
-	if !bytes.Equal(peer.session.UpdateV1(), v1Update) {
-		t.Fatalf("peer.session.UpdateV1() = %x, want %x", peer.session.UpdateV1(), v1Update)
-	}
+	assertConnectionSyncStep2EquivalentToV1(t, sender, v1Update)
+	assertConnectionSyncStep2EquivalentToV1(t, peer, v1Update)
 }
 
 func mustDecodeProtocolHex(t *testing.T, value string) []byte {

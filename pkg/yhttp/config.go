@@ -14,9 +14,11 @@ import (
 )
 
 const (
-	defaultReadLimitBytes = 16 << 20
-	defaultWriteTimeout   = 5 * time.Second
-	defaultPersistTimeout = 5 * time.Second
+	defaultReadLimitBytes    = 16 << 20
+	defaultWriteTimeout      = 5 * time.Second
+	defaultPersistTimeout    = 5 * time.Second
+	defaultFanoutConcurrency = 16
+	fanoutParallelThreshold  = 4
 )
 
 // Request descreve como uma requisição HTTP deve ser associada ao provider.
@@ -112,6 +114,9 @@ type ServerConfig struct {
 	ReadLimitBytes   int64
 	WriteTimeout     time.Duration
 	PersistTimeout   time.Duration
+	// FanoutConcurrency limita quantos peers recebem o mesmo broadcast em
+	// paralelo. Valores <= 0 usam o padrão do pacote.
+	FanoutConcurrency int
 	// BootstrapOnConnect envia um bootstrap direto de sync + awareness quando o
 	// WebSocket é aceito. É útil para clientes y-websocket receberem presença já
 	// conhecida sem aguardar o próximo heartbeat de awareness.

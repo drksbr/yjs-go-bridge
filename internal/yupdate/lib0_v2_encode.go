@@ -1,6 +1,6 @@
 package yupdate
 
-import "unicode/utf16"
+import "strings"
 
 type uintOptRleEncoder struct {
 	value uint32
@@ -20,7 +20,7 @@ func (e *uintOptRleEncoder) write(value uint32) {
 
 func (e *uintOptRleEncoder) bytes() []byte {
 	e.flush()
-	return append([]byte(nil), e.data...)
+	return e.data
 }
 
 func (e *uintOptRleEncoder) flush() {
@@ -57,7 +57,7 @@ func (e *intDiffOptRleEncoder) write(value uint32) {
 
 func (e *intDiffOptRleEncoder) bytes() []byte {
 	e.flush()
-	return append([]byte(nil), e.data...)
+	return e.data
 }
 
 func (e *intDiffOptRleEncoder) flush() {
@@ -95,21 +95,21 @@ func (e *rleByteEncoder) write(value byte) {
 }
 
 func (e *rleByteEncoder) bytes() []byte {
-	return append([]byte(nil), e.data...)
+	return e.data
 }
 
 type stringEncoderV2 struct {
-	table   string
+	table   strings.Builder
 	lengths uintOptRleEncoder
 }
 
 func (e *stringEncoderV2) write(value string) {
-	e.table += value
-	e.lengths.write(uint32(len(utf16.Encode([]rune(value)))))
+	e.table.WriteString(value)
+	e.lengths.write(utf16Length(value))
 }
 
 func (e *stringEncoderV2) bytes() []byte {
-	out := appendLib0VarString(nil, e.table)
+	out := appendLib0VarString(nil, e.table.String())
 	return append(out, e.lengths.bytes()...)
 }
 

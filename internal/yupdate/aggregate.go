@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	"sort"
 	"sync"
 )
 
-const defaultUpdateAggregateWorkers = 5
+const (
+	defaultUpdateAggregateWorkers       = 5
+	sequentialUpdateAggregateMaxUpdates = 4
+)
 
 type aggregateResult[T any] struct {
 	index int
@@ -38,6 +40,9 @@ func aggregatePayloadsInParallel[T any](
 	if len(updates) == 0 {
 		return reducer(ctx, make([]T, 0))
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	workerCount := defaultUpdateAggregateWorkers
 	if workers > 0 {
@@ -46,6 +51,9 @@ func aggregatePayloadsInParallel[T any](
 	workerCount = resolveWorkerCount(workerCount, len(updates))
 	if workerCount == 0 {
 		return zero, nil
+	}
+	if shouldAggregateSequentially(workerCount, len(updates)) {
+		return aggregatePayloadsSequentially(ctx, updates, extract, reducer)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -90,26 +98,50 @@ func aggregatePayloadsInParallel[T any](
 		close(results)
 	}()
 
-	out := make([]aggregateResult[T], 0, len(updates))
+	entries := make([]T, len(updates))
+	errs := make([]error, len(updates))
 	for result := range results {
-		out = append(out, result)
+		entries[result.index] = result.value
+		errs[result.index] = result.err
 	}
 
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].index < out[j].index
-	})
-
-	entries := make([]T, 0, len(out))
-	for _, result := range out {
-		if result.err != nil {
-			return zero, result.err
+	for _, err := range errs {
+		if err != nil {
+			return zero, err
 		}
-		entries = append(entries, result.value)
 	}
 	if err := ctx.Err(); err != nil {
 		return zero, err
 	}
 
+	return reducer(ctx, entries)
+}
+
+func shouldAggregateSequentially(workerCount int, updatesCount int) bool {
+	return workerCount == 1 || updatesCount <= sequentialUpdateAggregateMaxUpdates
+}
+
+func aggregatePayloadsSequentially[T any](
+	ctx context.Context,
+	updates [][]byte,
+	extract func(context.Context, int, []byte) (T, error),
+	reducer func(context.Context, []T) (T, error),
+) (T, error) {
+	var zero T
+	entries := make([]T, 0, len(updates))
+	for index, update := range updates {
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		value, err := runUpdateTaskSafely(ctx, index, update, extract)
+		if err != nil {
+			return zero, err
+		}
+		entries = append(entries, value)
+	}
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
 	return reducer(ctx, entries)
 }
 

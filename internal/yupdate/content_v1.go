@@ -131,7 +131,6 @@ func appendVarUintV1(dst []byte, value uint32) []byte {
 }
 
 func appendVarStringV1(dst []byte, value string) []byte {
-	data := []byte(value)
-	dst = varint.Append(dst, uint32(len(data)))
-	return append(dst, data...)
+	dst = varint.Append(dst, uint32(len(value)))
+	return append(dst, value...)
 }

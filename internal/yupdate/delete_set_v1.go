@@ -2,7 +2,6 @@ package yupdate
 
 import (
 	"fmt"
-	"slices"
 
 	ybinary "github.com/drksbr/yjs-crdt-golang-server/internal/binary"
 	"github.com/drksbr/yjs-crdt-golang-server/internal/varint"
@@ -18,19 +17,15 @@ import (
 //   - quantidade de ranges deletados
 //   - pares clock/length em ordem crescente de clock
 func AppendDeleteSetBlockV1(dst []byte, ds *ytypes.DeleteSet) []byte {
-	clients := ds.Clients()
-	slices.Reverse(clients)
-
-	dst = varint.Append(dst, uint32(len(clients)))
-	for _, client := range clients {
-		ranges := ds.Ranges(client)
+	dst = varint.Append(dst, uint32(ds.ClientCount()))
+	ds.ForEachClientDesc(func(client uint32, ranges []ytypes.DeleteRange) {
 		dst = varint.Append(dst, client)
 		dst = varint.Append(dst, uint32(len(ranges)))
 		for _, r := range ranges {
 			dst = varint.Append(dst, r.Clock)
 			dst = varint.Append(dst, r.Length)
 		}
-	}
+	})
 	return dst
 }
 

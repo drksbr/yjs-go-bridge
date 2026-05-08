@@ -118,11 +118,22 @@ func DecodeUpdate(update []byte) (*DecodedUpdate, error) {
 // StateVectorFromUpdate extrai o state vector de um único update conforme o
 // formato detectado no payload.
 func StateVectorFromUpdate(update []byte) (map[uint32]uint32, error) {
-	decoded, err := DecodeUpdate(update)
+	format, err := FormatFromUpdate(update)
 	if err != nil {
 		return nil, err
 	}
-	return stateVectorFromStructs(decoded.Structs), nil
+	switch format {
+	case UpdateFormatV1:
+		return stateVectorFromUpdateV1(update)
+	case UpdateFormatV2:
+		decoded, err := DecodeV2(update)
+		if err != nil {
+			return nil, err
+		}
+		return stateVectorFromStructs(decoded.Structs), nil
+	default:
+		return nil, ErrUnknownUpdateFormat
+	}
 }
 
 // EncodeStateVectorFromUpdate extrai e serializa o state vector de um único
@@ -146,11 +157,7 @@ func CreateContentIDsFromUpdate(update []byte) (*ContentIDs, error) {
 	case UpdateFormatV1:
 		return CreateContentIDsFromUpdateV1(update)
 	case UpdateFormatV2:
-		converted, err := ConvertUpdateToV1(update)
-		if err != nil {
-			return nil, err
-		}
-		return CreateContentIDsFromUpdateV1(converted)
+		return CreateContentIDsFromUpdateV2(update)
 	default:
 		return nil, ErrUnknownUpdateFormat
 	}
@@ -225,21 +232,7 @@ func ConvertUpdatesToV1Context(ctx context.Context, updates ...[]byte) ([]byte, 
 		}
 		return MergeUpdatesV1Context(ctx, filtered...)
 	case UpdateFormatV2:
-		converted := make([][]byte, 0, len(updates))
-		for i, update := range updates {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if len(update) == 0 {
-				continue
-			}
-			v1, err := ConvertUpdateToV1(update)
-			if err != nil {
-				return nil, fmt.Errorf("update[%d]: %w", i, err)
-			}
-			converted = append(converted, v1)
-		}
-		return MergeUpdatesV1Context(ctx, converted...)
+		return convertV2UpdatesToV1Context(ctx, updates...)
 	default:
 		return nil, ErrUnknownUpdateFormat
 	}
@@ -408,7 +401,7 @@ func MergeUpdatesContext(ctx context.Context, updates ...[]byte) ([]byte, error)
 	case UpdateFormatV1:
 		return MergeUpdatesV1Context(ctx, updates...)
 	case UpdateFormatV2:
-		return ConvertUpdatesToV1Context(ctx, updates...)
+		return convertV2UpdatesToV1Context(ctx, updates...)
 	default:
 		return nil, ErrUnknownUpdateFormat
 	}
@@ -426,4 +419,30 @@ func MergeUpdatesV2Context(ctx context.Context, updates ...[]byte) ([]byte, erro
 		return ConvertUpdatesToV2Context(ctx)
 	}
 	return ConvertUpdatesToV2Context(ctx, updates...)
+}
+
+func convertV2UpdatesToV1Context(ctx context.Context, updates ...[]byte) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	filtered := make([][]byte, 0, len(updates))
+	for _, update := range updates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if len(update) == 0 {
+			continue
+		}
+		filtered = append(filtered, update)
+	}
+
+	merged, err := aggregatePayloadsInParallel(ctx, filtered, 0, decodeMergeUpdate, mergeDecodedUpdatesV1)
+	if err != nil {
+		return nil, err
+	}
+	out, err := encodeStructGroupsV1(merged.blockSet.clients)
+	if err != nil {
+		return nil, err
+	}
+	return AppendDeleteSetBlockV1(out, merged.deleteSet), nil
 }
