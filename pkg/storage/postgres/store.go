@@ -301,14 +301,29 @@ RETURNING stored_at
 }
 
 func encodePersistedSnapshotPayloads(snapshot *yjsbridge.PersistedSnapshot) ([]byte, []byte, error) {
+	payloadV1, err := yjsbridge.EncodePersistedSnapshotV1(snapshot)
+	if err != nil {
+		return nil, nil, err
+	}
 	payloadV2, err := yjsbridge.EncodePersistedSnapshotV2(snapshot)
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, payloadV2, nil
+	return payloadV1, payloadV2, nil
 }
 
 func decodePersistedSnapshotPayload(payloadV1, payloadV2 []byte) (*yjsbridge.PersistedSnapshot, error) {
+	if len(payloadV1) > 0 && len(payloadV2) > 0 {
+		payloadV2AsV1, err := yjsbridge.ConvertUpdateToV1(payloadV2)
+		if err != nil {
+			return nil, err
+		}
+		merged, err := yjsbridge.MergeUpdates(payloadV1, payloadV2AsV1)
+		if err != nil {
+			return nil, err
+		}
+		return yjsbridge.PersistedSnapshotFromUpdate(merged)
+	}
 	if len(payloadV2) > 0 {
 		return yjsbridge.DecodePersistedSnapshotV2(payloadV2)
 	}

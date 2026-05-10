@@ -5,14 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/drksbr/yjs-crdt-golang-server/internal/varint"
 	"github.com/drksbr/yjs-crdt-golang-server/internal/ytypes"
@@ -177,6 +180,94 @@ func TestPostgresWebSocketSmoke_RecoveryFromSnapshotAndUpdateLog(t *testing.T) {
 	assertSyncStep2MatchesUpdate(t, reply, expected)
 }
 
+func TestPostgresWebSocketSmoke_LargeYTextPersistence(t *testing.T) {
+	dsn := postgresSmokeDSN(t)
+	schema := newSmokeSchema(t.Name())
+	defer dropSmokeSchema(t, dsn, schema)
+	key := storage.DocumentKey{Namespace: "integration", DocumentID: "large-ytext"}
+
+	server1, closeServer1 := newPostgresSmokeServer(t, dsn, schema)
+	writer := dialSmokeWS(t, server1.URL+"/ws?doc=large-ytext&client=701&conn=writer&persist=1")
+
+	updates := buildChunkedYTextUpdates(1701, "content", 20000, 1000)
+	expected := mustMergeUpdates(t, updates...)
+	for idx, update := range updates {
+		writeSmokeBinary(t, writer, yprotocol.EncodeProtocolSyncUpdate(update))
+		if idx%5 == 4 {
+			t.Logf("large ytext postgres smoke: enviados %d/%d chunks", idx+1, len(updates))
+		}
+	}
+
+	closeSmokeWS(t, writer)
+	waitPersistedSnapshot(t, dsn, schema, key)
+	closeServer1()
+
+	store, err := pgstore.New(context.Background(), pgstore.Config{
+		ConnectionString: dsn,
+		Schema:           schema,
+	})
+	if err != nil {
+		t.Fatalf("pgstore.New(large-ytext) unexpected error: %v", err)
+	}
+	record, err := store.LoadSnapshot(context.Background(), key)
+	if err != nil {
+		store.Close()
+		t.Fatalf("LoadSnapshot(large-ytext) unexpected error: %v", err)
+	}
+	gotState, err := yjsbridge.StateVectorFromUpdate(record.Snapshot.UpdateV1)
+	if err != nil {
+		store.Close()
+		t.Fatalf("StateVectorFromUpdate(snapshot) unexpected error: %v", err)
+	}
+	wantState, err := yjsbridge.StateVectorFromUpdate(expected)
+	if err != nil {
+		store.Close()
+		t.Fatalf("StateVectorFromUpdate(expected) unexpected error: %v", err)
+	}
+	if gotState[1701] != wantState[1701] {
+		store.Close()
+		t.Fatalf("persisted snapshot clock = %d, want %d", gotState[1701], wantState[1701])
+	}
+	store.Close()
+
+	server2, closeServer2 := newPostgresSmokeServer(t, dsn, schema)
+	defer closeServer2()
+
+	probe := dialSmokeWS(t, server2.URL+"/ws?doc=large-ytext&client=702&conn=probe")
+	writeSmokeBinary(t, probe, yprotocol.EncodeProtocolSyncStep1([]byte{0x00}))
+	reply := readSmokeBinary(t, probe)
+	assertSyncStep2MatchesUpdate(t, reply, expected)
+}
+
+func postgresSmokeDSN(t *testing.T) string {
+	t.Helper()
+
+	if dsn := strings.TrimSpace(os.Getenv("POSTGRES_TEST_DSN")); dsn != "" {
+		return dsn
+	}
+	return startDockerPostgres(t).dsn
+}
+
+func dropSmokeSchema(t *testing.T, dsn, schema string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Logf("cleanup postgres schema skipped: connect failed: %v", err)
+		return
+	}
+	defer func() {
+		_ = conn.Close(context.Background())
+	}()
+
+	quoted := `"` + strings.ReplaceAll(schema, `"`, `""`) + `"`
+	if _, err := conn.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quoted)); err != nil {
+		t.Logf("cleanup postgres schema %s failed: %v", schema, err)
+	}
+}
+
 func TestPostgresWebSocketSmoke_Performance(t *testing.T) {
 	pg := startDockerPostgres(t)
 	schema := newSmokeSchema(t.Name())
@@ -286,6 +377,7 @@ func dialSmokeWS(t *testing.T, rawURL string) *websocket.Conn {
 	if err != nil {
 		t.Fatalf("websocket.Dial(%q) unexpected error: %v", wsURL, err)
 	}
+	conn.SetReadLimit(16 << 20)
 	t.Cleanup(func() { _ = conn.CloseNow() })
 	return conn
 }
@@ -352,4 +444,59 @@ func buildGCOnlyUpdate(client, length uint32) []byte {
 	update = append(update, 0)
 	update = varint.Append(update, length)
 	return append(update, yupdate.EncodeDeleteSetBlockV1(ytypes.NewDeleteSet())...)
+}
+
+func buildChunkedYTextUpdates(client uint32, parent string, words int, wordsPerUpdate int) [][]byte {
+	updates := make([][]byte, 0, (words+wordsPerUpdate-1)/wordsPerUpdate)
+	clock := uint32(0)
+	for start := 0; start < words; start += wordsPerUpdate {
+		end := start + wordsPerUpdate
+		if end > words {
+			end = words
+		}
+		text := buildLargeTextFragment(start, end, start > 0)
+		updates = append(updates, buildYTextInsertUpdate(client, clock, parent, text))
+		clock += uint32(len(text))
+	}
+	return updates
+}
+
+func buildLargeTextFragment(start, end int, leadingSpace bool) string {
+	var b strings.Builder
+	b.Grow((end - start) * 12)
+	if leadingSpace {
+		b.WriteByte(' ')
+	}
+	for i := start; i < end; i++ {
+		if i > start {
+			b.WriteByte(' ')
+		}
+		b.WriteString("palavra")
+		b.WriteString(strconv.Itoa(i))
+	}
+	return b.String()
+}
+
+func buildYTextInsertUpdate(client, clock uint32, parent string, text string) []byte {
+	update := varint.Append(nil, 1)
+	update = varint.Append(update, 1)
+	update = varint.Append(update, client)
+	update = varint.Append(update, clock)
+	if clock == 0 {
+		update = append(update, 4)
+		update = varint.Append(update, 1)
+		update = appendVarString(update, parent)
+	} else {
+		update = append(update, 0x84)
+		update = varint.Append(update, client)
+		update = varint.Append(update, clock-1)
+	}
+	update = appendVarString(update, text)
+	return varint.Append(update, 0)
+}
+
+func appendVarString(dst []byte, value string) []byte {
+	bytes := []byte(value)
+	dst = varint.Append(dst, uint32(len(bytes)))
+	return append(dst, bytes...)
 }

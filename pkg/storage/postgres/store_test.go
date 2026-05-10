@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -140,7 +141,7 @@ func TestStoreSaveAndLoadSnapshotCheckpointRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSaveSnapshotQueryWritesOnlyV2Payload(t *testing.T) {
+func TestSaveSnapshotQueryWritesBothSnapshotPayloads(t *testing.T) {
 	t.Parallel()
 
 	snapshot, err := yjsbridge.PersistedSnapshotFromUpdates()
@@ -169,8 +170,8 @@ func TestSaveSnapshotQueryWritesOnlyV2Payload(t *testing.T) {
 	if len(args) != 6 {
 		t.Fatalf("saveSnapshotQuery() args len = %d, want 6", len(args))
 	}
-	if args[2] != nil {
-		t.Fatalf("saveSnapshotQuery() V1 arg = %v, want nil", args[2])
+	if !bytes.Equal(args[2].([]byte), payloadV1) {
+		t.Fatalf("saveSnapshotQuery() V1 arg = %v, want %v", args[2], payloadV1)
 	}
 	if !bytes.Equal(args[3].([]byte), payloadV2) {
 		t.Fatalf("saveSnapshotQuery() V2 arg = %v, want %v", args[3], payloadV2)
@@ -183,7 +184,7 @@ func TestSaveSnapshotQueryWritesOnlyV2Payload(t *testing.T) {
 	}
 }
 
-func TestStoreSaveSnapshotStoresOnlyV2Payload(t *testing.T) {
+func TestStoreSaveSnapshotStoresBothPayloads(t *testing.T) {
 	store, schema := newTestStore(t, false)
 	ctx := context.Background()
 
@@ -193,67 +194,91 @@ func TestStoreSaveSnapshotStoresOnlyV2Payload(t *testing.T) {
 	}
 	key := storage.DocumentKey{
 		Namespace:  "integration",
-		DocumentID: "save-snapshot-v2-only",
+		DocumentID: "save-snapshot-both-payloads",
 	}
 	if _, err := store.SaveSnapshot(ctx, key, snapshot); err != nil {
 		t.Fatalf("SaveSnapshot() unexpected error: %v", err)
 	}
 
 	query := fmt.Sprintf(`
-SELECT snapshot_v1 IS NULL, octet_length(snapshot_v2)
+SELECT octet_length(snapshot_v1), octet_length(snapshot_v2)
 FROM %s.document_snapshots
 WHERE namespace = $1 AND document_id = $2
 `, quoteIdentifier(schema))
-	var v1IsNull bool
+	var v1Bytes int
 	var v2Bytes int
-	if err := store.pool.QueryRow(ctx, query, key.Namespace, key.DocumentID).Scan(&v1IsNull, &v2Bytes); err != nil {
+	if err := store.pool.QueryRow(ctx, query, key.Namespace, key.DocumentID).Scan(&v1Bytes, &v2Bytes); err != nil {
 		t.Fatalf("query persisted snapshot payloads unexpected error: %v", err)
 	}
-	if !v1IsNull {
-		t.Fatal("snapshot_v1 stored duplicate payload, want NULL")
+	if v1Bytes == 0 {
+		t.Fatal("snapshot_v1 is empty")
 	}
 	if v2Bytes == 0 {
 		t.Fatal("snapshot_v2 is empty")
 	}
 }
 
-func TestDecodePersistedSnapshotPayloadPrefersV2WithV1Fallback(t *testing.T) {
+func TestDecodePersistedSnapshotPayloadReconcilesV1AndV2(t *testing.T) {
 	t.Parallel()
 
-	snapshot, err := yjsbridge.PersistedSnapshotFromUpdates()
+	oldUpdate := mustDecodePostgresHex(t, "0101b4ece9cb0500040107636f6e74656e74084c696e686120310a00")
+	newUpdate := mustDecodePostgresHex(t, "0101b4ece9cb050884b4ece9cb0507274c696e6861203220636f6d206163656e746f733a2061c3a7c3a36f2c20636f7261c3a7c3a36f0a00")
+	fullSnapshot, err := yjsbridge.PersistedSnapshotFromUpdates(oldUpdate, newUpdate)
 	if err != nil {
 		t.Fatalf("PersistedSnapshotFromUpdates() unexpected error: %v", err)
 	}
-	_, payloadV2, err := encodePersistedSnapshotPayloads(snapshot)
+	staleSnapshot, err := yjsbridge.PersistedSnapshotFromUpdates(oldUpdate)
 	if err != nil {
-		t.Fatalf("encodePersistedSnapshotPayloads() unexpected error: %v", err)
+		t.Fatalf("PersistedSnapshotFromUpdates(stale) unexpected error: %v", err)
 	}
-	payloadV1, err := yjsbridge.EncodePersistedSnapshotV1(snapshot)
+	payloadV1, err := yjsbridge.EncodePersistedSnapshotV1(fullSnapshot)
 	if err != nil {
-		t.Fatalf("EncodePersistedSnapshotV1() unexpected error: %v", err)
+		t.Fatalf("EncodePersistedSnapshotV1(full) unexpected error: %v", err)
+	}
+	_, stalePayloadV2, err := encodePersistedSnapshotPayloads(staleSnapshot)
+	if err != nil {
+		t.Fatalf("encodePersistedSnapshotPayloads(stale) unexpected error: %v", err)
 	}
 
-	fromV2, err := decodePersistedSnapshotPayload([]byte{0xff}, payloadV2)
+	reconciled, err := decodePersistedSnapshotPayload(payloadV1, stalePayloadV2)
+	if err != nil {
+		t.Fatalf("decodePersistedSnapshotPayload(reconcile) unexpected error: %v", err)
+	}
+	if !bytes.Equal(reconciled.UpdateV1, fullSnapshot.UpdateV1) {
+		t.Fatalf("reconciled.UpdateV1 = %x, want full %x", reconciled.UpdateV1, fullSnapshot.UpdateV1)
+	}
+
+	fromV2, err := decodePersistedSnapshotPayload(nil, stalePayloadV2)
 	if err != nil {
 		t.Fatalf("decodePersistedSnapshotPayload(v2) unexpected error: %v", err)
 	}
-	if !bytes.Equal(fromV2.UpdateV1, snapshot.UpdateV1) {
-		t.Fatalf("decodePersistedSnapshotPayload(v2).UpdateV1 = %v, want %v", fromV2.UpdateV1, snapshot.UpdateV1)
+	if !bytes.Equal(fromV2.UpdateV1, staleSnapshot.UpdateV1) {
+		t.Fatalf("decodePersistedSnapshotPayload(v2).UpdateV1 = %v, want %v", fromV2.UpdateV1, staleSnapshot.UpdateV1)
 	}
-	if !bytes.Equal(fromV2.UpdateV2, payloadV2) {
-		t.Fatalf("decodePersistedSnapshotPayload(v2).UpdateV2 = %v, want %v", fromV2.UpdateV2, payloadV2)
+	if !bytes.Equal(fromV2.UpdateV2, stalePayloadV2) {
+		t.Fatalf("decodePersistedSnapshotPayload(v2).UpdateV2 = %v, want %v", fromV2.UpdateV2, stalePayloadV2)
 	}
 
 	fromV1, err := decodePersistedSnapshotPayload(payloadV1, nil)
 	if err != nil {
 		t.Fatalf("decodePersistedSnapshotPayload(v1 fallback) unexpected error: %v", err)
 	}
-	if !bytes.Equal(fromV1.UpdateV1, snapshot.UpdateV1) {
-		t.Fatalf("decodePersistedSnapshotPayload(v1 fallback).UpdateV1 = %v, want %v", fromV1.UpdateV1, snapshot.UpdateV1)
+	if !bytes.Equal(fromV1.UpdateV1, fullSnapshot.UpdateV1) {
+		t.Fatalf("decodePersistedSnapshotPayload(v1 fallback).UpdateV1 = %v, want %v", fromV1.UpdateV1, fullSnapshot.UpdateV1)
 	}
-	if !bytes.Equal(fromV1.UpdateV2, snapshot.UpdateV2) {
-		t.Fatalf("decodePersistedSnapshotPayload(v1 fallback).UpdateV2 = %v, want %v", fromV1.UpdateV2, snapshot.UpdateV2)
+	if !bytes.Equal(fromV1.UpdateV2, fullSnapshot.UpdateV2) {
+		t.Fatalf("decodePersistedSnapshotPayload(v1 fallback).UpdateV2 = %v, want %v", fromV1.UpdateV2, fullSnapshot.UpdateV2)
 	}
+}
+
+func mustDecodePostgresHex(t *testing.T, value string) []byte {
+	t.Helper()
+
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		t.Fatalf("hex.DecodeString(%q) unexpected error: %v", value, err)
+	}
+	return decoded
 }
 
 func TestStoreLoadMissingSnapshot(t *testing.T) {

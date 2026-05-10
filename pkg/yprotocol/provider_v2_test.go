@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 	"testing"
 
+	"github.com/drksbr/yjs-crdt-golang-server/internal/varint"
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/storage"
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/storage/memory"
 	"github.com/drksbr/yjs-crdt-golang-server/pkg/yjsbridge"
@@ -228,6 +231,173 @@ func TestProviderOpenHydratesRoomV2FromPersistedSnapshot(t *testing.T) {
 
 	assertProtocolV2PayloadEquivalentToV1(t, conn.room.updateV2, update)
 	assertConnectionSyncStep2EquivalentToV1(t, conn, update)
+}
+
+func TestProviderPersistReopenPreservesIncrementalYTextContent(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	key := storage.DocumentKey{Namespace: "tests", DocumentID: "provider-ytext-reopen"}
+	store := memory.New()
+	provider := NewProvider(ProviderConfig{Store: store})
+	conn, err := provider.Open(ctx, key, "conn-a", 941)
+	if err != nil {
+		t.Fatalf("provider.Open() unexpected error: %v", err)
+	}
+
+	updates := [][]byte{
+		mustDecodeProtocolHex(t, "0101b4ece9cb0500040107636f6e74656e74084c696e686120310a00"),
+		mustDecodeProtocolHex(t, "0101b4ece9cb050884b4ece9cb0507274c696e6861203220636f6d206163656e746f733a2061c3a7c3a36f2c20636f7261c3a7c3a36f0a00"),
+		mustDecodeProtocolHex(t, "0101b4ece9cb052b84b4ece9cb052a1b4c696e6861203320636f6d20656d6f6a693a20f09f98802066696d00"),
+	}
+	expected, err := yjsbridge.MergeUpdates(updates...)
+	if err != nil {
+		t.Fatalf("MergeUpdates(incremental text updates) unexpected error: %v", err)
+	}
+
+	for idx, update := range updates {
+		if _, err := conn.HandleEncodedMessages(EncodeProtocolSyncUpdate(update)); err != nil {
+			t.Fatalf("HandleEncodedMessages(sync-update %d) unexpected error: %v", idx, err)
+		}
+	}
+	assertProtocolV2PayloadEquivalentToV1(t, conn.room.updateV2, expected)
+
+	if _, err := conn.Persist(ctx); err != nil {
+		t.Fatalf("conn.Persist() unexpected error: %v", err)
+	}
+	if _, err := conn.Close(); err != nil {
+		t.Fatalf("conn.Close() unexpected error: %v", err)
+	}
+
+	reopenedProvider := NewProvider(ProviderConfig{Store: store})
+	reopened, err := reopenedProvider.Open(ctx, key, "conn-b", 942)
+	if err != nil {
+		t.Fatalf("reopened provider.Open() unexpected error: %v", err)
+	}
+
+	assertProtocolV2PayloadEquivalentToV1(t, reopened.room.updateV2, expected)
+	assertConnectionSyncStep2EquivalentToV1(t, reopened, expected)
+
+	logRecords, err := store.ListUpdates(ctx, key, 0, 0)
+	if err != nil {
+		t.Fatalf("store.ListUpdates() unexpected error: %v", err)
+	}
+	if len(logRecords) != 0 {
+		t.Fatalf("len(logRecords) = %d, want compacted log trimmed", len(logRecords))
+	}
+}
+
+func TestProviderPersistReopenPreservesLargeYTextContent(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	key := storage.DocumentKey{Namespace: "tests", DocumentID: "provider-ytext-reopen-large"}
+	store := memory.New()
+	provider := NewProvider(ProviderConfig{Store: store})
+	conn, err := provider.Open(ctx, key, "conn-a", 951)
+	if err != nil {
+		t.Fatalf("provider.Open() unexpected error: %v", err)
+	}
+
+	updates := buildChunkedYTextUpdatesForTest(961, "content", 20000, 1000)
+	expected, err := yjsbridge.MergeUpdates(updates...)
+	if err != nil {
+		t.Fatalf("MergeUpdates(large text updates) unexpected error: %v", err)
+	}
+
+	for idx, update := range updates {
+		if _, err := conn.HandleEncodedMessages(EncodeProtocolSyncUpdate(update)); err != nil {
+			t.Fatalf("HandleEncodedMessages(large sync-update %d) unexpected error: %v", idx, err)
+		}
+	}
+	assertProtocolV2PayloadEquivalentToV1(t, conn.room.updateV2, expected)
+
+	if _, err := conn.Persist(ctx); err != nil {
+		t.Fatalf("conn.Persist() unexpected error: %v", err)
+	}
+	if _, err := conn.Close(); err != nil {
+		t.Fatalf("conn.Close() unexpected error: %v", err)
+	}
+
+	reopenedProvider := NewProvider(ProviderConfig{Store: store})
+	reopened, err := reopenedProvider.Open(ctx, key, "conn-b", 952)
+	if err != nil {
+		t.Fatalf("reopened provider.Open() unexpected error: %v", err)
+	}
+
+	assertProtocolV2PayloadEquivalentToV1(t, reopened.room.updateV2, expected)
+	assertConnectionSyncStep2EquivalentToV1(t, reopened, expected)
+
+	record, err := store.LoadSnapshot(ctx, key)
+	if err != nil {
+		t.Fatalf("store.LoadSnapshot() unexpected error: %v", err)
+	}
+	gotState, err := yjsbridge.StateVectorFromUpdate(record.Snapshot.UpdateV1)
+	if err != nil {
+		t.Fatalf("StateVectorFromUpdate(snapshot) unexpected error: %v", err)
+	}
+	wantState, err := yjsbridge.StateVectorFromUpdate(expected)
+	if err != nil {
+		t.Fatalf("StateVectorFromUpdate(expected) unexpected error: %v", err)
+	}
+	if gotState[961] != wantState[961] {
+		t.Fatalf("snapshot state clock = %d, want %d", gotState[961], wantState[961])
+	}
+}
+
+func buildChunkedYTextUpdatesForTest(client uint32, parent string, words int, wordsPerUpdate int) [][]byte {
+	var updates [][]byte
+	clock := uint32(0)
+	for start := 0; start < words; start += wordsPerUpdate {
+		end := start + wordsPerUpdate
+		if end > words {
+			end = words
+		}
+		text := buildLargeTextFragmentForTest(start, end, start > 0)
+		updates = append(updates, buildYTextInsertUpdateForTest(client, clock, parent, text))
+		clock += uint32(len(text))
+	}
+	return updates
+}
+
+func buildLargeTextFragmentForTest(start, end int, leadingSpace bool) string {
+	var b strings.Builder
+	b.Grow((end - start) * 12)
+	if leadingSpace {
+		b.WriteByte(' ')
+	}
+	for i := start; i < end; i++ {
+		if i > start {
+			b.WriteByte(' ')
+		}
+		b.WriteString("palavra")
+		b.WriteString(strconv.Itoa(i))
+	}
+	return b.String()
+}
+
+func buildYTextInsertUpdateForTest(client, clock uint32, parent string, text string) []byte {
+	update := varint.Append(nil, 1)
+	update = varint.Append(update, 1)
+	update = varint.Append(update, client)
+	update = varint.Append(update, clock)
+	if clock == 0 {
+		update = append(update, 4)
+		update = varint.Append(update, 1)
+		update = appendVarStringForTest(update, parent)
+	} else {
+		update = append(update, 0x84)
+		update = varint.Append(update, client)
+		update = varint.Append(update, clock-1)
+	}
+	update = appendVarStringForTest(update, text)
+	return varint.Append(update, 0)
+}
+
+func appendVarStringForTest(dst []byte, value string) []byte {
+	bytes := []byte(value)
+	dst = varint.Append(dst, uint32(len(bytes)))
+	return append(dst, bytes...)
 }
 
 func assertProtocolV2PayloadEquivalentToV1(t *testing.T, gotV2, wantV1 []byte) {
