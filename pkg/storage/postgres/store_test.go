@@ -141,7 +141,7 @@ func TestStoreSaveAndLoadSnapshotCheckpointRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSaveSnapshotQueryWritesBothSnapshotPayloads(t *testing.T) {
+func TestSaveSnapshotQueryWritesOnlyV2SnapshotPayload(t *testing.T) {
 	t.Parallel()
 
 	snapshot, err := yjsbridge.PersistedSnapshotFromUpdates()
@@ -170,8 +170,11 @@ func TestSaveSnapshotQueryWritesBothSnapshotPayloads(t *testing.T) {
 	if len(args) != 6 {
 		t.Fatalf("saveSnapshotQuery() args len = %d, want 6", len(args))
 	}
-	if !bytes.Equal(args[2].([]byte), payloadV1) {
-		t.Fatalf("saveSnapshotQuery() V1 arg = %v, want %v", args[2], payloadV1)
+	if payloadV1 != nil {
+		t.Fatalf("encodePersistedSnapshotPayloads() V1 payload = %v, want nil", payloadV1)
+	}
+	if args[2] != nil {
+		t.Fatalf("saveSnapshotQuery() V1 arg = %v, want nil", args[2])
 	}
 	if !bytes.Equal(args[3].([]byte), payloadV2) {
 		t.Fatalf("saveSnapshotQuery() V2 arg = %v, want %v", args[3], payloadV2)
@@ -184,7 +187,7 @@ func TestSaveSnapshotQueryWritesBothSnapshotPayloads(t *testing.T) {
 	}
 }
 
-func TestStoreSaveSnapshotStoresBothPayloads(t *testing.T) {
+func TestStoreSaveSnapshotStoresOnlyV2Payload(t *testing.T) {
 	store, schema := newTestStore(t, false)
 	ctx := context.Background()
 
@@ -194,31 +197,31 @@ func TestStoreSaveSnapshotStoresBothPayloads(t *testing.T) {
 	}
 	key := storage.DocumentKey{
 		Namespace:  "integration",
-		DocumentID: "save-snapshot-both-payloads",
+		DocumentID: "save-snapshot-v2-only",
 	}
 	if _, err := store.SaveSnapshot(ctx, key, snapshot); err != nil {
 		t.Fatalf("SaveSnapshot() unexpected error: %v", err)
 	}
 
 	query := fmt.Sprintf(`
-SELECT octet_length(snapshot_v1), octet_length(snapshot_v2)
+SELECT snapshot_v1 IS NULL, octet_length(snapshot_v2)
 FROM %s.document_snapshots
 WHERE namespace = $1 AND document_id = $2
 `, quoteIdentifier(schema))
-	var v1Bytes int
+	var v1IsNull bool
 	var v2Bytes int
-	if err := store.pool.QueryRow(ctx, query, key.Namespace, key.DocumentID).Scan(&v1Bytes, &v2Bytes); err != nil {
+	if err := store.pool.QueryRow(ctx, query, key.Namespace, key.DocumentID).Scan(&v1IsNull, &v2Bytes); err != nil {
 		t.Fatalf("query persisted snapshot payloads unexpected error: %v", err)
 	}
-	if v1Bytes == 0 {
-		t.Fatal("snapshot_v1 is empty")
+	if !v1IsNull {
+		t.Fatal("snapshot_v1 is not null")
 	}
 	if v2Bytes == 0 {
 		t.Fatal("snapshot_v2 is empty")
 	}
 }
 
-func TestDecodePersistedSnapshotPayloadReconcilesV1AndV2(t *testing.T) {
+func TestSnapshotPayloadsUseV2StorageWithCompatibilityNormalization(t *testing.T) {
 	t.Parallel()
 
 	oldUpdate := mustDecodePostgresHex(t, "0101b4ece9cb0500040107636f6e74656e74084c696e686120310a00")
@@ -231,7 +234,25 @@ func TestDecodePersistedSnapshotPayloadReconcilesV1AndV2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PersistedSnapshotFromUpdates(stale) unexpected error: %v", err)
 	}
-	payloadV1, err := yjsbridge.EncodePersistedSnapshotV1(fullSnapshot)
+
+	staleInput := *fullSnapshot
+	staleInput.UpdateV2 = staleSnapshot.UpdateV2
+	payloadV1, payloadV2, err := encodePersistedSnapshotPayloads(&staleInput)
+	if err != nil {
+		t.Fatalf("encodePersistedSnapshotPayloads(stale input) unexpected error: %v", err)
+	}
+	if payloadV1 != nil {
+		t.Fatalf("encodePersistedSnapshotPayloads(stale input) V1 payload = %v, want nil", payloadV1)
+	}
+	decodedPayloadV2, err := decodePersistedSnapshotPayload(nil, payloadV2)
+	if err != nil {
+		t.Fatalf("decodePersistedSnapshotPayload(canonical v2) unexpected error: %v", err)
+	}
+	if !bytes.Equal(decodedPayloadV2.UpdateV1, fullSnapshot.UpdateV1) {
+		t.Fatalf("canonical V2 decoded UpdateV1 = %x, want full %x", decodedPayloadV2.UpdateV1, fullSnapshot.UpdateV1)
+	}
+
+	payloadV1, err = yjsbridge.EncodePersistedSnapshotV1(fullSnapshot)
 	if err != nil {
 		t.Fatalf("EncodePersistedSnapshotV1(full) unexpected error: %v", err)
 	}

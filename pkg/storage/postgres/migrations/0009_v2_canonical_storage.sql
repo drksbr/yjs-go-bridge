@@ -4,6 +4,10 @@ ALTER TABLE {{schema}}.document_snapshots
 ALTER TABLE {{schema}}.document_update_logs
     ALTER COLUMN update_v1 DROP NOT NULL;
 
+UPDATE {{schema}}.document_snapshots
+SET snapshot_v1 = NULL
+WHERE snapshot_v2 IS NOT NULL;
+
 UPDATE {{schema}}.document_update_logs
 SET update_v1 = NULL
 WHERE update_v2 IS NOT NULL;

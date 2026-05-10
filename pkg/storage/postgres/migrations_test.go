@@ -59,6 +59,7 @@ func TestLoadMigrations(t *testing.T) {
 		if migration.version == 9 &&
 			strings.Contains(migration.sql, "ALTER COLUMN snapshot_v1 DROP NOT NULL") &&
 			strings.Contains(migration.sql, "ALTER COLUMN update_v1 DROP NOT NULL") &&
+			strings.Contains(migration.sql, "SET snapshot_v1 = NULL") &&
 			strings.Contains(migration.sql, "SET update_v1 = NULL") {
 			foundV2CanonicalStorage = true
 		}
